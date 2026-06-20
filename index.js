@@ -31,7 +31,9 @@ function json(res, code, obj) { cors(res); res.writeHead(code, { 'Content-Type':
 function readBody(req) { return new Promise((r) => { let b = ''; req.on('data', (c) => (b += c)); req.on('end', () => r(b)); }); }
 
 // 回调路由 → msg_type_str
-const MSGTYPE = { gift: 'live_gift', like: 'live_like', comment: 'live_comment', team: 'team_select' };
+// 粉丝团[必接]：经典-角力品类要求绑定回调，但本游戏不消费粉丝团数据 →
+// 登记进来只为让 /cb/fansclub 被 200 ack（translate 命中 default 返回 []，无游戏效果），避免 404。
+const MSGTYPE = { gift: 'live_gift', like: 'live_like', comment: 'live_comment', team: 'team_select', fansclub: 'live_fansclub' };
 
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, `http://localhost:${cfg.PORT}`);
