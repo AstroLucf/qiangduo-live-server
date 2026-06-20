@@ -1,0 +1,10 @@
+{
+  "name": "qiangduo-live-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "抢夺45分钟 · 抖音直播小玩法 本地服务端（零依赖：原生 http + SSE）",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  }
+}
