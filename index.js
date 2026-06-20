@@ -40,6 +40,11 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'OPTIONS') { cors(res); res.writeHead(204); return res.end(); }
 
+  // 根路径：抖音云就绪探针可能 GET / 期望 2xx（别落到 404）
+  if (path === '/' && req.method === 'GET') {
+    return json(res, 200, { ok: true, service: 'qiangduo-live', clients: clients.size });
+  }
+
   // 健康检查
   if (path === '/health') {
     return json(res, 200, { ok: true, clients: clients.size, appid: cfg.APPID, skipSign: cfg.DEV_SKIP_SIGN, defaultSide: cfg.DEFAULT_SIDE });
