@@ -67,6 +67,8 @@ const server = http.createServer(async (req, res) => {
     const msgType = MSGTYPE[path.slice(4)];
     if (!msgType) return json(res, 404, { ok: false, err: 'unknown callback' });
     const raw = await readBody(req);
+    // 沙盒期抓字段：完整打印抖音推来的原始头+体，用首条真实样例锁 douyin.js 的 GIFT_ID_TO_KEY。上生产前收掉这行。
+    console.log(`[cb] ${msgType}  x-msg-type=${req.headers['x-msg-type'] || '-'}  x-roomid=${req.headers['x-roomid'] || '-'}  x-signature=${req.headers['x-signature'] ? 'present' : '-'}  raw=${raw}`);
     if (!cfg.DEV_SKIP_SIGN && !dy.verifySign(req.headers, raw, cfg.APPSECRET)) {
       return json(res, 401, { ok: false, err: 'bad signature' });
     }
