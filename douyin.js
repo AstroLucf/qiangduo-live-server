@@ -11,8 +11,13 @@ const crypto = require('crypto');
 // —— 礼物 → GIFTS key 映射 ——
 // GIFTS 键（见 src/main.js:14）：join/like/c666/wand/pill/donut/battery/mic/airdrop
 // 【最可靠】按「礼物置顶」后拿到的 sec_gift_id 精确映射（沙盒里置顶后回填这张表）：
+// 2026-06-21 沙盒自查工具实抓的真实 sec_gift_id（精确映射，免受 gift_value 单位歧义影响）：
 const GIFT_ID_TO_KEY = {
-  // '<沙盒里置顶礼物的 sec_gift_id>': 'donut',
+  'n1/Dg1905sj1FyoBlQBvmbaDZFBNaKuKZH6zxHkv8Lg5x2cRfrKUTb8gzMs=': 'wand',    // 仙女棒 1抖币
+  '28rYzVFNyXEXFC8HI+f/WG+I7a6lfl3OyZZjUS+CVuwCgYZrPrUdytGHu0c=': 'pill',    // 能力药丸 10抖币
+  'PJ0FFeaDzXUreuUBZH6Hs+b56Jh0tQjrq0bIrrlZmv13GSAL9Q1hf59fjGk=': 'donut',   // 甜甜圈 52抖币
+  'YbLESoUj053FWVYPWUNOAtp4FYnb+/eZbyrLi7ndArVFz14rivgxf0cFrKs=': 'mic',     // 派对话筒 299抖币
+  'pGLo7HKNk1i4djkicmJXf6iWEyd+pfPBjbsHmd3WcX0Ierm2UdnRR7UINvI=': 'airdrop', // 神秘空投 520抖币
 };
 // 【兜底】按抖币价就近归档（取“价 ≤ 礼物价值”里的最高档）。
 // ⚠ gift_value/diamond 的单位（抖币? 分?）待沙盒真实样例确认；置顶映射可彻底绕开此兜底。

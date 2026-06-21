@@ -19,4 +19,9 @@ module.exports = {
   // 选队数据未知时，礼物默认归哪边：'ignore'(丢弃) / 'left' / 'right'。
   // 正式期观众都会先「选队」，应保持 ignore；本机自测可临时设 left/right。
   DEFAULT_SIDE: process.env.DEFAULT_SIDE || 'ignore',
+
+  // 开发期同源托管游戏文件 + 沙盒测试台（SERVE_STATIC=1）。
+  // 开启后浏览器/Electron 开 http://localhost:8787/index.html?live=1 即同源连 SSE，
+  // 规避 file://→localhost 的 PNA/跨域；/test 是可视化测试台。云端不设此 env，故 / 仍是健康探针、不暴露测试台。
+  SERVE_STATIC: process.env.SERVE_STATIC === '1',
 };
