@@ -116,12 +116,21 @@ async function startGame(headers, body) {
 // 头 x-msg-type + X-Anchor-OpenID；逐条 translate → WS 下行 → 战绩累计。
 async function liveDataCallback(headers, rawBody) {
   const msgType = headers['x-msg-type'] || '';
-  const anchorOpenId = headers['x-anchor-openid'] || '';
+  // ⚠ 抖音内网回调头不一定带主播 openid（多为 x-roomid 等）→ 回退用开局 /start_game token 置换存的 lastAnchorOpenId。
+  // 否则 pushToClient 拿不到 openid 会直接 return、不下行 → 礼物翻译成功(applied>0)但游戏全没反应。
+  const anchorOpenId = headers['x-anchor-openid'] || lastAnchorOpenId;
   let items; try { items = JSON.parse(rawBody || '[]'); } catch (_) { items = []; }
   if (!Array.isArray(items)) items = [items];
+  log('收到回调 type=' + msgType + ' 条数=' + items.length +
+      ' anchor=' + (headers['x-anchor-openid'] ? '头携带' : (lastAnchorOpenId ? '回退开局存的' : '⚠️空(下行会丢,exe 没开过局?)')));
   for (const item of items) {
     const events = dy.translate(msgType, item, cfg.DEFAULT_SIDE);     // → [{side,key,count}]
-    if (events.length) await pushToClient(anchorOpenId, item.msg_id, msgType, JSON.stringify(events));
+    if (events.length) {
+      log('→ 翻译', JSON.stringify(events), '下行至', anchorOpenId ? (anchorOpenId.slice(0, 10) + '…') : '⚠️无openid(不下行)');
+      await pushToClient(anchorOpenId, item.msg_id, msgType, JSON.stringify(events));
+    } else {
+      log('→ 翻译为空 type=' + msgType + ' gift_id=' + (item.sec_gift_id || '-') + ' val=' + (item.gift_value || item.diamond || '-') + '(礼物没置顶映射? 或未选队且 DEFAULT_SIDE=ignore?)');
+    }
     // 战绩累计（礼物驱动每用户分）
     if (msgType === 'live_gift') {
       const openId = item.sec_openid || item.sec_open_id;
