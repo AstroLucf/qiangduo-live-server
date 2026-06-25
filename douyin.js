@@ -51,34 +51,80 @@ function verifySign(headers, rawBody, appSecret) {
   return calc === sig;
 }
 
-// —— 把一条互动回调翻译成 0~N 条 { side, key, count } 游戏指令 ——
+// —— 用户身份：三类回调字段名一致（sec_openid / nickname / avatar_url，官方 data-open 文档确认）——
+// 统一抽出来，原样透传给客户端，用于「真实昵称提示 + 小火箭真实头像 + 按 openid 去重」。
+function userOf(payload) {
+  return {
+    openid: payload.sec_openid || payload.sec_open_id || '',
+    nickname: payload.nickname || payload.nick_name || '',
+    avatar: payload.avatar_url || payload.avatar || payload.head_url || '',
+  };
+}
+
+// —— 评论选队：观众发含关键词的评论即选边（大壮=left / 小美=right）——
+// 关键词按运营可调；纯数字「1/2」沿用 index.html 原设计（弹幕 1 帮大壮、2 帮小美）。
+const TEAM_WORDS = {
+  left: ['1', '大壮', '壮', '帮大壮', '左'],
+  right: ['2', '小美', '美', '帮小美', '右'],
+};
+function sideFromComment(content) {
+  const s = String(content || '').trim();
+  if (!s) return null;
+  const hitL = TEAM_WORDS.left.some((w) => s === w || s.includes(w));
+  const hitR = TEAM_WORDS.right.some((w) => s === w || s.includes(w));
+  if (hitL && !hitR) return 'left';
+  if (hitR && !hitL) return 'right';
+  return null;                                   // 都含/都不含 → 不当选队，按普通评论加力
+}
+
+// —— 原生「用户选队」回调 /cb/team 的阵营字段：真机字段名/值待一条样例锁定（同 sec_gift_id 流程），
+// 先做多字段名 + 多值容错；锁定后把真实字段/值补进来即可精确命中。
+function normalizeSide(raw) {
+  if (raw == null) return null;
+  const s = String(raw).trim().toLowerCase();
+  if (['left', 'l', '1', 'red', '红', '红方', '大壮', '左'].includes(s)) return 'left';
+  if (['right', 'r', '2', 'blue', '蓝', '蓝方', '小美', '右'].includes(s)) return 'right';
+  return null;
+}
+function sideFromTeam(payload) {
+  const raw = payload.side ?? payload.team ?? payload.camp ?? payload.team_id
+    ?? payload.group ?? payload.group_id ?? payload.party ?? payload.faction;
+  return normalizeSide(raw);
+}
+
+// —— 把一条互动回调翻译成 0~N 条 { side, key, count, openid, nickname, avatar } 游戏指令 ——
 // msgType 取 msg_type_str（live_gift / live_like / live_comment）；选队类型字符串待官方确认，
 // 这里用内部约定 'team_select'，由回调路由 /cb/team 映射进来。
 function translate(msgType, payload, defaultSide) {
-  const openid = payload.sec_openid || payload.sec_open_id;
+  const u = userOf(payload);
   switch (msgType) {
     case 'live_gift': {
-      const side = sideOf(openid, defaultSide);
+      const side = sideOf(u.openid, defaultSide);
       if (side !== 'left' && side !== 'right') return [];
       const key = giftToKey({ sec_gift_id: payload.sec_gift_id, diamond: payload.gift_value || payload.diamond });
       const count = clampInt(payload.gift_num, 1, 20);     // 连击上限 20，防刷屏
-      return [{ side, key, count, from: payload.nickname }];
+      return [{ side, key, count, ...u }];
     }
     case 'live_like': {                                     // 点赞=氛围，不按 like_num 放大（且低概率丢包）
-      const side = sideOf(openid, defaultSide);
+      const side = sideOf(u.openid, defaultSide);
       if (side !== 'left' && side !== 'right') return [];
-      return [{ side, key: 'like', count: 1, from: payload.nickname }];
+      return [{ side, key: 'like', count: 1, ...u }];
     }
     case 'live_comment': {
-      const side = sideOf(openid, defaultSide);
+      const picked = sideFromComment(payload.content);      // 评论选队：含「1/大壮」→左、「2/小美」→右
+      if (picked) {
+        setSide(u.openid, picked);                          // 记边 → 该用户后续礼物/点赞都归这边
+        return [{ side: picked, key: 'join', count: 1, ...u }];   // 选队即「加入」永久推力 + 入场小火箭
+      }
+      const side = sideOf(u.openid, defaultSide);            // 非选队评论 → 普通加力（须已选过队）
       if (side !== 'left' && side !== 'right') return [];
-      return [{ side, key: 'c666', count: 1, from: payload.nickname }];
+      return [{ side, key: 'c666', count: 1, ...u }];
     }
-    case 'team_select': {                                   // 选队：记边 + 一次「加入」永久推力
-      const side = payload.side === 'left' || payload.side === 'right' ? payload.side : null;
+    case 'team_select': {                                   // 原生选队：记边 + 一次「加入」永久推力
+      const side = sideFromTeam(payload);
       if (!side) return [];
-      setSide(openid, side);
-      return [{ side, key: 'join', count: 1, from: payload.nickname }];
+      setSide(u.openid, side);
+      return [{ side, key: 'join', count: 1, ...u }];
     }
     default: return [];
   }

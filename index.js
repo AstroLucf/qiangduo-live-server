@@ -49,25 +49,29 @@ button:hover{background:#3a3f4a}.g{background:#33271e}.g:hover{background:#46362
 #log{margin-top:16px;background:#0e1014;border:1px solid #23262d;border-radius:8px;padding:10px;height:150px;overflow:auto;font:12px/1.7 ui-monospace,monospace;color:#86d98a}
 </style></head><body>
 <h1>🎮 沙盒测试台 · 抢夺45分钟</h1>
-<p class="hint">另开标签打开 <b>/index.html?live=1</b>（游戏），点下方按钮 → 模拟抖音观众<b>选队+送礼</b>走完整服务端管线（回调→翻译→SSE→游戏）→ <b>游戏实时反应</b>。礼物按抖币价映射特效/推力档。</p>
+<p class="hint">另开标签打开 <b>/index.html?live=1</b>（游戏），点下方按钮 → 模拟抖音观众走完整服务端管线（回调→翻译→SSE→游戏）。每次轮换一名观众（带<b>真实昵称+头像</b>），首次互动自动发“<b>1/2</b>”<b>评论选队</b>；<b>重复点同名观众</b>验证“小火箭不重复生成”。</p>
 <div class="cols">
  <div class="col L"><h2>帮大壮（左）</h2>
   <button class="g" data-side="left" data-v="1">仙女棒 ×1</button><button class="g" data-side="left" data-v="10">药丸 ×10</button><button class="g" data-side="left" data-v="52">甜甜圈 ×52</button><button class="g" data-side="left" data-v="99">电池 ×99</button><button class="g" data-side="left" data-v="299">话筒 ×299</button><button class="g" data-side="left" data-v="520">🪂 空投 ×520</button>
-  <div class="misc"><button data-side="left" data-act="like">点赞</button><button data-side="left" data-act="comment">评论666</button></div></div>
+  <div class="misc"><button data-side="left" data-act="team">原生选队</button><button data-side="left" data-act="like">点赞</button><button data-side="left" data-act="comment">评论666</button></div></div>
  <div class="col R"><h2>帮小美（右）</h2>
   <button class="g" data-side="right" data-v="1">仙女棒 ×1</button><button class="g" data-side="right" data-v="10">药丸 ×10</button><button class="g" data-side="right" data-v="52">甜甜圈 ×52</button><button class="g" data-side="right" data-v="99">电池 ×99</button><button class="g" data-side="right" data-v="299">话筒 ×299</button><button class="g" data-side="right" data-v="520">🪂 空投 ×520</button>
-  <div class="misc"><button data-side="right" data-act="like">点赞</button><button data-side="right" data-act="comment">评论666</button></div></div>
+  <div class="misc"><button data-side="right" data-act="team">原生选队</button><button data-side="right" data-act="like">点赞</button><button data-side="right" data-act="comment">评论666</button></div></div>
 </div>
 <div id="log"></div>
 <script>
-var seq={left:0,right:0},joined={};
+var NAMES={left:['大壮真爱粉','打工人老李','二郎腿哥','吃瓜群众','复读机'],right:['小美贴贴','学委同桌','奶茶续命','榜一大姐','摸鱼怪']};
+var seq={left:0,right:0},chosen={};
 function logln(m){var d=document.createElement('div');d.textContent=new Date().toLocaleTimeString()+'  '+m;var L=document.getElementById('log');L.insertBefore(d,L.firstChild);}
 function post(p,b){return fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).then(function(r){return r.json();}).catch(function(e){return {err:String(e)};});}
-function ensureSide(uid,side){if(joined[uid])return Promise.resolve();joined[uid]=1;return post('/cb/team',{sec_openid:uid,side:side});}
-function gift(side,v){var uid='u_'+side+'_'+((seq[side]++%3)+1);ensureSide(uid,side).then(function(){return post('/cb/gift',{sec_openid:uid,gift_value:v,gift_num:1,nickname:uid});}).then(function(r){logln('🎁 '+side+' 价值'+v+' ('+uid+') → applied:'+(r&&r.applied!==undefined?r.applied:'?'));});}
-function misc(side,act){var uid='u_'+side+'_1';ensureSide(uid,side).then(function(){return post('/cb/'+act,{sec_openid:uid,content:'666',nickname:uid});}).then(function(r){logln((act==='like'?'👍 点赞 ':'💬 评论 ')+side+' → applied:'+(r&&r.applied!==undefined?r.applied:'?'));});}
-Array.prototype.forEach.call(document.querySelectorAll('button'),function(b){b.onclick=function(){var s=b.getAttribute('data-side'),v=b.getAttribute('data-v');if(v)gift(s,parseInt(v,10));else misc(s,b.getAttribute('data-act'));};});
-logln('就绪 — 点按钮，看游戏标签实时反应');
+function pick(side){var i=seq[side]++%NAMES[side].length;return {uid:'u_'+side+'_'+i,name:NAMES[side][i]};}
+function ava(uid){return 'https://api.dicebear.com/9.x/thumbs/png?seed='+encodeURIComponent(uid)+'&size=80';}
+function ensure(u,side){if(chosen[u.uid])return Promise.resolve();chosen[u.uid]=side;return post('/cb/comment',{sec_openid:u.uid,content:side==='left'?'1':'2',nickname:u.name,avatar_url:ava(u.uid)}).then(function(){logln('🏳️ '+u.name+' 发“'+(side==='left'?'1':'2')+'” 加入'+(side==='left'?'大壮':'小美')+'队');});}
+function gift(side,v){var u=pick(side);ensure(u,side).then(function(){return post('/cb/gift',{sec_openid:u.uid,gift_value:v,gift_num:1,nickname:u.name,avatar_url:ava(u.uid)});}).then(function(r){logln('🎁 '+u.name+' 送 价值'+v+' → applied:'+(r&&r.applied!==undefined?r.applied:'?'));});}
+function misc(side,act){var u=pick(side);ensure(u,side).then(function(){return post('/cb/'+act,{sec_openid:u.uid,content:act==='comment'?'666':'',nickname:u.name,avatar_url:ava(u.uid)});}).then(function(r){logln((act==='like'?'👍 ':'💬 ')+u.name+' → applied:'+(r&&r.applied!==undefined?r.applied:'?'));});}
+function teamRaw(side){var u=pick(side);chosen[u.uid]=side;return post('/cb/team',{sec_openid:u.uid,side:side,nickname:u.name,avatar_url:ava(u.uid)}).then(function(r){logln('🎮 原生选队 '+u.name+' → '+(side==='left'?'大壮':'小美')+' applied:'+(r&&r.applied!==undefined?r.applied:'?'));});}
+Array.prototype.forEach.call(document.querySelectorAll('button'),function(b){b.onclick=function(){var s=b.getAttribute('data-side'),v=b.getAttribute('data-v'),act=b.getAttribute('data-act');if(v)gift(s,parseInt(v,10));else if(act==='team')teamRaw(s);else misc(s,act);};});
+logln('就绪 — 点按钮，看游戏标签实时反应（同名观众重复点 → 小火箭不应重复生成）');
 </script></body></html>`;
 
 function broadcast(events) {
