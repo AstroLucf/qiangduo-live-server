@@ -133,19 +133,26 @@ const server = http.createServer(async (req, res) => {
     if (!cfg.DEV_SKIP_SIGN && !dy.verifySign(req.headers, raw, cfg.APPSECRET)) {
       return json(res, 401, { ok: false, err: 'bad signature' });
     }
-    let payload; try { payload = JSON.parse(raw || '{}'); } catch (_) { payload = {}; }
-    const roomId = req.headers['x-roomid'] || payload.room_id || '';
+    // ⚠ 抖音回调 raw 是数组 [{...}]（可能多条），不是单对象！之前直接把数组丢给 translate →
+    //   payload.content/avatar_url/sec_openid 全取不到（数据在 [0] 里）→ 评论"1/2"不识别为选队、
+    //   头像空、整批"0 事件被丢弃"。改为逐条 translate（与 douyincloud.js 生产路径一致）。
+    let items; try { const p = JSON.parse(raw || '[]'); items = Array.isArray(p) ? p : [p]; } catch (_) { items = []; }
+    const roomId = req.headers['x-roomid'] || (items[0] && items[0].room_id) || '';
     if (roomId) lastRoomId = roomId;
-    const events = dy.translate(msgType, payload, cfg.DEFAULT_SIDE);
-    // 沙盒诊断：打印解析结果，一眼看出 openid/avatar/side 是否取到（(空!)=真机字段名与 douyin.js 候选不符，照上面 raw 把真实字段名补进 userOf/commentText 数组首位）。
-    if (events[0]) console.log(`[cb→] side=${events[0].side} key=${events[0].key} openid=${events[0].openid || '(空!)'} avatar=${events[0].avatar ? '有' : '(空!)'} nick=${events[0].nickname || '(空)'}`);
-    else console.log(`[cb→] ${msgType} → 0 事件（未选队 / 字段取空被丢弃）`);
-    broadcast(events);
-    // 战绩累计：礼物驱动每用户分（open_id 用回调用户标识；side 用选队/缺省，与 translate 同源）
-    if (msgType === 'live_gift') {
-      const openId = dy.userOf(payload).openid;
-      rank.recordGift({ openId, side: dy.sideOf(openId, cfg.DEFAULT_SIDE), value: payload.gift_value || payload.diamond, roomId: roomId || lastRoomId });
+    let events = [];
+    for (const item of items) {
+      const evs = dy.translate(msgType, item, cfg.DEFAULT_SIDE);
+      // 诊断：(空!)=该字段没取到
+      if (evs[0]) console.log(`[cb→] side=${evs[0].side} key=${evs[0].key} openid=${evs[0].openid || '(空!)'} avatar=${evs[0].avatar ? '有' : '(空!)'} nick=${evs[0].nickname || '(空)'}`);
+      else console.log(`[cb→] ${msgType} → 0 事件（未选队 / 字段取空被丢弃）`);
+      events = events.concat(evs);
+      // 战绩累计：礼物驱动每用户分
+      if (msgType === 'live_gift') {
+        const openId = dy.userOf(item).openid;
+        rank.recordGift({ openId, side: dy.sideOf(openId, cfg.DEFAULT_SIDE), value: item.gift_value || item.diamond, roomId: roomId || lastRoomId });
+      }
     }
+    broadcast(events);
     // TODO(联调)：收到并处理成功后，调抖音「履约数据上报」做 ack（去重 + 结算依据）。
     return json(res, 200, { ok: true, applied: events.length });
   }
