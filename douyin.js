@@ -135,18 +135,21 @@ function translate(msgType, payload, defaultSide) {
       return [{ side, key: 'like', count: 1, ...u }];
     }
     case 'live_comment': {
-      const picked = sideFromComment(commentText(payload));  // 评论选队：含「1/大壮」→左、「2/小美」→右(内容跨多字段名容错取)
-      if (picked) {
-        setSide(u.openid, picked);                          // 记边 → 该用户后续礼物/点赞都归这边
-        return [{ side: picked, key: 'join', count: 1, ...u }];   // 选队即「加入」永久推力 + 入场小火箭
+      const picked = sideFromComment(commentText(payload));  // 评论选队：含「1/大壮」→左、「2/小美」→右
+      const prev = sideOf(u.openid, '');                     // 之前选过的队（空=没选过）
+      if (picked && !prev) {                                 // 【仅首次】选队 → 加入（永久推力 + 入场火箭）
+        setSide(u.openid, picked);
+        return [{ side: picked, key: 'join', count: 1, ...u }];
       }
-      const side = sideOf(u.openid, defaultSide);            // 非选队评论 → 普通加力（须已选过队）
+      // 已选过队后：再喊 1/2 或任何评论 → 都算给【已锁定的队】普通加力(c666)；不重复加入、不切队、不给对面刷力
+      const side = prev || sideOf(u.openid, defaultSide);
       if (side !== 'left' && side !== 'right') return [];
       return [{ side, key: 'c666', count: 1, ...u }];
     }
-    case 'team_select': {                                   // 原生选队：记边 + 一次「加入」永久推力
+    case 'team_select': {                                   // 原生选队：仅首次记边 + 一次「加入」；重复点忽略
       const side = sideFromTeam(payload);
       if (!side) return [];
+      if (sideOf(u.openid, '')) return [];                  // 已选过队 → 忽略重复选队（不重复刷永久推力）
       setSide(u.openid, side);
       return [{ side, key: 'join', count: 1, ...u }];
     }
