@@ -51,14 +51,38 @@ function verifySign(headers, rawBody, appSecret) {
   return calc === sig;
 }
 
-// —— 用户身份：三类回调字段名一致（sec_openid / nickname / avatar_url，官方 data-open 文档确认）——
-// 统一抽出来，原样透传给客户端，用于「真实昵称提示 + 小火箭真实头像 + 按 openid 去重」。
+// —— 用户身份：真机回调字段名以 index.js 的 [cb] raw 日志为准；这里跨「多候选名 + 一层嵌套」尽量容错命中。
+// 抓到一条真机样例后，把命中的真实字段名补到对应数组首位即可精确锁定。
+// 原样透传给客户端，用于「真实昵称提示 + 小火箭真实头像 + 按 openid 去重」。
+function deepPick(payload, keys) {
+  const nests = [payload, payload.user, payload.data, payload.sender, payload.from_user, payload.user_info, payload.userInfo];
+  for (const o of nests) {
+    if (!o || typeof o !== 'object') continue;
+    for (const k of keys) if (o[k] != null && o[k] !== '') return o[k];
+  }
+  return '';
+}
+// 抖音头像常是嵌套对象 {url_list:[url,…]} 或 {url:…}，不是扁平字符串。
+// deepPick 命中 avatar_thumb 会返回整个对象 → 客户端 avatar 变 [object Object]、渲染失败 →
+// 这就是真机「永远不显示真实头像」的头号坑。pickUrl 把真实 URL 抠出来。
+function pickUrl(v) {
+  if (!v) return '';
+  if (typeof v === 'string') return v;
+  if (Array.isArray(v)) return pickUrl(v[0]);
+  if (typeof v === 'object') return pickUrl(v.url_list || v.urlList || v.url || v.uri || v.avatar_thumb || v.avatar || '');
+  return '';
+}
 function userOf(payload) {
   return {
-    openid: payload.sec_openid || payload.sec_open_id || '',
-    nickname: payload.nickname || payload.nick_name || '',
-    avatar: payload.avatar_url || payload.avatar || payload.head_url || '',
+    openid:   deepPick(payload, ['sec_openid', 'sec_open_id', 'open_id', 'openid', 'openId', 'sec_uid', 'user_id', 'uid']),
+    nickname: deepPick(payload, ['nickname', 'nick_name', 'nickName', 'nick', 'user_name', 'userName', 'name']),
+    // 先扁平字符串字段、再抖音标准嵌套字段(avatar_thumb.url_list[0]…)，统一过 pickUrl 抠出真实 URL
+    avatar:   pickUrl(deepPick(payload, ['avatar_url', 'avatarUrl', 'head_url', 'headUrl', 'head_img', 'avatar_thumb', 'avatar', 'avatar_medium', 'avatar_large', 'head'])),
   };
+}
+// 评论内容也跨多候选字段名取（真机字段名以 raw 日志为准）
+function commentText(payload) {
+  return deepPick(payload, ['content', 'comment', 'text', 'msg', 'message', 'comment_text', 'commentText']);
 }
 
 // —— 评论选队：观众发含关键词的评论即选边（大壮=left / 小美=right）——
@@ -111,7 +135,7 @@ function translate(msgType, payload, defaultSide) {
       return [{ side, key: 'like', count: 1, ...u }];
     }
     case 'live_comment': {
-      const picked = sideFromComment(payload.content);      // 评论选队：含「1/大壮」→左、「2/小美」→右
+      const picked = sideFromComment(commentText(payload));  // 评论选队：含「1/大壮」→左、「2/小美」→右(内容跨多字段名容错取)
       if (picked) {
         setSide(u.openid, picked);                          // 记边 → 该用户后续礼物/点赞都归这边
         return [{ side: picked, key: 'join', count: 1, ...u }];   // 选队即「加入」永久推力 + 入场小火箭
@@ -132,4 +156,4 @@ function translate(msgType, payload, defaultSide) {
 
 function clampInt(v, lo, hi) { v = parseInt(v, 10); if (!Number.isFinite(v)) v = lo; return Math.max(lo, Math.min(v, hi)); }
 
-module.exports = { verifySign, translate, setSide, sideOf, giftToKey, GIFT_ID_TO_KEY };
+module.exports = { verifySign, translate, setSide, sideOf, giftToKey, GIFT_ID_TO_KEY, userOf };

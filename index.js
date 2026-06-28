@@ -137,10 +137,13 @@ const server = http.createServer(async (req, res) => {
     const roomId = req.headers['x-roomid'] || payload.room_id || '';
     if (roomId) lastRoomId = roomId;
     const events = dy.translate(msgType, payload, cfg.DEFAULT_SIDE);
+    // 沙盒诊断：打印解析结果，一眼看出 openid/avatar/side 是否取到（(空!)=真机字段名与 douyin.js 候选不符，照上面 raw 把真实字段名补进 userOf/commentText 数组首位）。
+    if (events[0]) console.log(`[cb→] side=${events[0].side} key=${events[0].key} openid=${events[0].openid || '(空!)'} avatar=${events[0].avatar ? '有' : '(空!)'} nick=${events[0].nickname || '(空)'}`);
+    else console.log(`[cb→] ${msgType} → 0 事件（未选队 / 字段取空被丢弃）`);
     broadcast(events);
     // 战绩累计：礼物驱动每用户分（open_id 用回调用户标识；side 用选队/缺省，与 translate 同源）
     if (msgType === 'live_gift') {
-      const openId = payload.sec_openid || payload.sec_open_id;
+      const openId = dy.userOf(payload).openid;
       rank.recordGift({ openId, side: dy.sideOf(openId, cfg.DEFAULT_SIDE), value: payload.gift_value || payload.diamond, roomId: roomId || lastRoomId });
     }
     // TODO(联调)：收到并处理成功后，调抖音「履约数据上报」做 ack（去重 + 结算依据）。
