@@ -153,9 +153,12 @@ function translate(msgType, payload, defaultSide) {
     case 'live_comment': {
       const intent = commentIntent(commentText(payload));
       if (intent === 'left' || intent === 'right') {         // 1/2 → 定向落座(可切队,每次都听)
-        const first = !chosenSide(u.openid);                 // 之前没选过队 = 首次落座
+        const prev = chosenSide(u.openid);                   // 此前所选队（'' = 没选过）
         setSide(u.openid, intent);                           // 定向(覆盖,允许左右互切)
-        return [{ side: intent, key: first ? 'join' : 'c666', count: 1, ...u }];  // 首次→加入(永久推力+入场);之后/切队→加力,不重复加入
+        // 首次落座 / 换到【不同】队 → 'join'：客户端走永久推力分支，把人从原队转移到新队（真正换队）。
+        // 只有重复喊【同一队】才 'c666'：只加力，不重复加入、不重复刷小火箭。
+        const key = prev === intent ? 'c666' : 'join';
+        return [{ side: intent, key, count: 1, ...u }];
       }
       if (intent === 'cheer') {                              // 666 → 随机落座(没喊过1/2就哈希分边;喊过归那边)+ 加力
         return [{ side: sideOf(u.openid, defaultSide), key: 'c666', count: 1, ...u }];

@@ -133,7 +133,7 @@ async function liveDataCallback(headers, rawBody) {
     }
     // 战绩累计（礼物驱动每用户分）
     if (msgType === 'live_gift') {
-      const openId = item.sec_openid || item.sec_open_id;
+      const openId = dy.userOf(item).openid;     // 与 dev(index.js)对齐：7 嵌套×8 字段名容错，避免真机字段名不符时 openId 取空、战绩静默丢失
       rank.recordGift({ openId, side: dy.sideOf(openId, cfg.DEFAULT_SIDE), value: item.gift_value || item.diamond, roomId: item.room_id || '' });
     }
   }
