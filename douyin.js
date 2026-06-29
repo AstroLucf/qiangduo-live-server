@@ -37,7 +37,23 @@ const userSide = new Map();                   // sec_openid -> 'left' | 'right'
 function setSide(openid, side) {
   if (openid && (side === 'left' || side === 'right')) userSide.set(openid, side);
 }
-function sideOf(openid, fallback) { return (openid && userSide.get(openid)) || fallback; }
+// 查该用户【主动选过】的队(评论1/2 · 原生选队)；没选过返回 ''(纯探测,绝不触发随机落座)
+function chosenSide(openid) { return (openid && userSide.get(openid)) || ''; }
+// 给一次互动定边：主动选过 → 那边；否则 DEFAULT_SIDE 指定 left/right → 固定；否则「随机落座」(哈希,没选队也参与、不丢弃)
+function sideOf(openid, fallback) {
+  const chosen = chosenSide(openid);
+  if (chosen) return chosen;
+  if (fallback === 'left' || fallback === 'right') return fallback;
+  return hashSide(openid);
+}
+// 随机落座：按 openid 哈希定边 —— 同一观众恒定一边(礼物不会一会左一会右)、整体两边均匀,
+// 且无内存依赖(FaaS 多实例天然一致,绕开内存 userSide 跨实例不共享的坑)。
+function hashSide(openid) {
+  const s = String(openid || '');
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return (h & 1) ? 'right' : 'left';
+}
 
 // —— 验签 ——（占位：标准 HMAC 结构；具体拼接顺序/算法用控制台「签名调试工具」校准后定稿）
 function verifySign(headers, rawBody, appSecret) {
@@ -136,7 +152,7 @@ function translate(msgType, payload, defaultSide) {
     }
     case 'live_comment': {
       const picked = sideFromComment(commentText(payload));  // 评论选队：含「1/大壮」→左、「2/小美」→右
-      const prev = sideOf(u.openid, '');                     // 之前选过的队（空=没选过）
+      const prev = chosenSide(u.openid);                     // 之前【主动选过】的队（空=没选过；不触发随机落座）
       if (picked && !prev) {                                 // 【仅首次】选队 → 加入（永久推力 + 入场火箭）
         setSide(u.openid, picked);
         return [{ side: picked, key: 'join', count: 1, ...u }];
@@ -149,7 +165,7 @@ function translate(msgType, payload, defaultSide) {
     case 'team_select': {                                   // 原生选队：仅首次记边 + 一次「加入」；重复点忽略
       const side = sideFromTeam(payload);
       if (!side) return [];
-      if (sideOf(u.openid, '')) return [];                  // 已选过队 → 忽略重复选队（不重复刷永久推力）
+      if (chosenSide(u.openid)) return [];                  // 已选过队 → 忽略重复选队（不重复刷永久推力）
       setSide(u.openid, side);
       return [{ side, key: 'join', count: 1, ...u }];
     }
@@ -159,4 +175,4 @@ function translate(msgType, payload, defaultSide) {
 
 function clampInt(v, lo, hi) { v = parseInt(v, 10); if (!Number.isFinite(v)) v = lo; return Math.max(lo, Math.min(v, hi)); }
 
-module.exports = { verifySign, translate, setSide, sideOf, giftToKey, GIFT_ID_TO_KEY, userOf };
+module.exports = { verifySign, translate, setSide, sideOf, chosenSide, giftToKey, GIFT_ID_TO_KEY, userOf };
