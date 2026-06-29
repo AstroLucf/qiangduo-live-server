@@ -101,20 +101,20 @@ function commentText(payload) {
   return deepPick(payload, ['content', 'comment', 'text', 'msg', 'message', 'comment_text', 'commentText']);
 }
 
-// —— 评论选队：观众发含关键词的评论即选边（大壮=left / 小美=right）——
-// 关键词按运营可调；纯数字「1/2」沿用 index.html 原设计（弹幕 1 帮大壮、2 帮小美）。
-const TEAM_WORDS = {
-  left: ['1', '大壮', '壮', '帮大壮', '左'],
-  right: ['2', '小美', '美', '帮小美', '右'],
-};
-function sideFromComment(content) {
+// —— 评论意图 ——
+//  · 「1/大壮」「2/小美」严格命中 → 'left'/'right'：定向落座(可切队)
+//  · 含「666」→ 'cheer'：加油(随机落座加力)
+//  · 其余评论(闲聊)→ null：不落座、不下发
+// 选队词用【严格相等】匹配(数组 includes，不是 s.includes)，避免「怎么跑到左去了」这类含字误判落座。
+const LEFT_WORDS = ['1', '大壮', '帮大壮', '左'];
+const RIGHT_WORDS = ['2', '小美', '帮小美', '右'];
+function commentIntent(content) {
   const s = String(content || '').trim();
   if (!s) return null;
-  const hitL = TEAM_WORDS.left.some((w) => s === w || s.includes(w));
-  const hitR = TEAM_WORDS.right.some((w) => s === w || s.includes(w));
-  if (hitL && !hitR) return 'left';
-  if (hitR && !hitL) return 'right';
-  return null;                                   // 都含/都不含 → 不当选队，按普通评论加力
+  if (LEFT_WORDS.includes(s)) return 'left';
+  if (RIGHT_WORDS.includes(s)) return 'right';
+  if (s.includes('666')) return 'cheer';
+  return null;
 }
 
 // —— 原生「用户选队」回调 /cb/team 的阵营字段：真机字段名/值待一条样例锁定（同 sec_gift_id 流程），
@@ -151,16 +151,16 @@ function translate(msgType, payload, defaultSide) {
       return [{ side, key: 'like', count: 1, ...u }];
     }
     case 'live_comment': {
-      const picked = sideFromComment(commentText(payload));  // 评论选队：含「1/大壮」→左、「2/小美」→右
-      const prev = chosenSide(u.openid);                     // 之前【主动选过】的队（空=没选过；不触发随机落座）
-      if (picked && !prev) {                                 // 【仅首次】选队 → 加入（永久推力 + 入场火箭）
-        setSide(u.openid, picked);
-        return [{ side: picked, key: 'join', count: 1, ...u }];
+      const intent = commentIntent(commentText(payload));
+      if (intent === 'left' || intent === 'right') {         // 1/2 → 定向落座(可切队,每次都听)
+        const first = !chosenSide(u.openid);                 // 之前没选过队 = 首次落座
+        setSide(u.openid, intent);                           // 定向(覆盖,允许左右互切)
+        return [{ side: intent, key: first ? 'join' : 'c666', count: 1, ...u }];  // 首次→加入(永久推力+入场);之后/切队→加力,不重复加入
       }
-      // 已选过队后：再喊 1/2 或任何评论 → 都算给【已锁定的队】普通加力(c666)；不重复加入、不切队、不给对面刷力
-      const side = prev || sideOf(u.openid, defaultSide);
-      if (side !== 'left' && side !== 'right') return [];
-      return [{ side, key: 'c666', count: 1, ...u }];
+      if (intent === 'cheer') {                              // 666 → 随机落座(没喊过1/2就哈希分边;喊过归那边)+ 加力
+        return [{ side: sideOf(u.openid, defaultSide), key: 'c666', count: 1, ...u }];
+      }
+      return [];                                             // 其余评论(闲聊)→ 不落座、不下发
     }
     case 'team_select': {                                   // 原生选队：仅首次记边 + 一次「加入」；重复点忽略
       const side = sideFromTeam(payload);
