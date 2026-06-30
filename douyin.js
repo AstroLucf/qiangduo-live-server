@@ -54,6 +54,24 @@ function hashSide(openid) {
   for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
   return (h & 1) ? 'right' : 'left';
 }
+// 匿名(无 openid)落座：当次随机，无法追踪到人 → 不锁、每次重算。
+function randSide() { return Math.random() < 0.5 ? 'right' : 'left'; }
+// —— 落座锁定(2026-06-30) ——
+// 规则：首次互动即【落座并锁死本局】——评论1/2按方向、其余(礼物/点赞/666)随机定边；
+// 之后该用户【任何】互动都归这一队、本局内永不改(再喊别的队也不换)。
+// 开局 clearSides() 清空 → 下一局重新拉队。匿名无身份 → 每次随机、不锁。
+// 这是「随机落座与1/2选队地位相同、一旦落座不得修改」的服务端唯一真源(替代会覆盖的 setSide)。
+function lockSide(openid, prefer) {
+  const chosen = chosenSide(openid);
+  if (chosen) return chosen;                                  // 已落座 → 永远归这边，不换
+  const side = (prefer === 'left' || prefer === 'right')
+    ? prefer                                                  // 评论1/2/原生选队：按方向落座
+    : (openid ? hashSide(openid) : randSide());               // 礼物/点赞/666：有身份哈希随机、匿名当次随机
+  if (openid) setSide(openid, side);                          // 有身份才能锁(匿名无法追踪到人)
+  return side;
+}
+// 开局清空落座记录 —— 配合「每局重新拉队」：上一局的落座不跨局残留。
+function clearSides() { userSide.clear(); }
 
 // —— 验签 ——（占位：标准 HMAC 结构；具体拼接顺序/算法用控制台「签名调试工具」校准后定稿）
 function verifySign(headers, rawBody, appSecret) {
@@ -139,38 +157,41 @@ function translate(msgType, payload, defaultSide) {
   const u = userOf(payload);
   switch (msgType) {
     case 'live_gift': {
-      const side = sideOf(u.openid, defaultSide);
+      const first = !chosenSide(u.openid);                  // 落座前判断是否首次互动
+      const side = lockSide(u.openid, defaultSide);          // 首次→落座并锁(随机/DEFAULT);已落座→归原队
       if (side !== 'left' && side !== 'right') return [];
       const key = giftToKey({ sec_gift_id: payload.sec_gift_id, diamond: payload.gift_value || payload.diamond });
       const count = clampInt(payload.gift_num, 1, 20);     // 连击上限 20，防刷屏
-      return [{ side, key, count, ...u }];
+      const giftEv = { side, key, count, ...u };
+      // 首次互动=正式加入(join 永久推力+入场小火箭)，再叠加本次礼物特效；之后只发礼物
+      return first ? [{ side, key: 'join', count: 1, ...u }, giftEv] : [giftEv];
     }
     case 'live_like': {                                     // 点赞=氛围，不按 like_num 放大（且低概率丢包）
-      const side = sideOf(u.openid, defaultSide);
+      const first = !chosenSide(u.openid);
+      const side = lockSide(u.openid, defaultSide);          // 首次→落座并锁;已落座→归原队
       if (side !== 'left' && side !== 'right') return [];
-      return [{ side, key: 'like', count: 1, ...u }];
+      return [{ side, key: first ? 'join' : 'like', count: 1, ...u }];  // 首次=正式加入(join);之后=点赞氛围
     }
     case 'live_comment': {
       const intent = commentIntent(commentText(payload));
-      if (intent === 'left' || intent === 'right') {         // 1/2 → 定向落座(可切队,每次都听)
-        const prev = chosenSide(u.openid);                   // 此前所选队（'' = 没选过）
-        setSide(u.openid, intent);                           // 定向(覆盖,允许左右互切)
-        // 首次落座 / 换到【不同】队 → 'join'：客户端走永久推力分支，把人从原队转移到新队（真正换队）。
-        // 只有重复喊【同一队】才 'c666'：只加力，不重复加入、不重复刷小火箭。
-        const key = prev === intent ? 'c666' : 'join';
-        return [{ side: intent, key, count: 1, ...u }];
+      if (intent === 'left' || intent === 'right') {         // 1/2 → 落座锁定：首次按方向落座；已落座归原队、不换
+        const first = !chosenSide(u.openid);                 // 之前没落座过 = 首次
+        const side = lockSide(u.openid, intent);             // 首次→按方向落座并锁;已落座→归原队(忽略这次喊的方向)
+        return [{ side, key: first ? 'join' : 'c666', count: 1, ...u }];  // 首次→加入(永久推力);已落座→只加力、不换队
       }
-      if (intent === 'cheer') {                              // 666 → 随机落座(没喊过1/2就哈希分边;喊过归那边)+ 加力
-        return [{ side: sideOf(u.openid, defaultSide), key: 'c666', count: 1, ...u }];
+      if (intent === 'cheer') {                              // 666 → 落座锁定：首次随机落座并【加入】;已落座归原队加力
+        const first = !chosenSide(u.openid);
+        const side = lockSide(u.openid, defaultSide);
+        return [{ side, key: first ? 'join' : 'c666', count: 1, ...u }];  // 首次→加入(永久推力);已落座→加力
       }
       return [];                                             // 其余评论(闲聊)→ 不落座、不下发
     }
-    case 'team_select': {                                   // 原生选队：仅首次记边 + 一次「加入」；重复点忽略
-      const side = sideFromTeam(payload);
-      if (!side) return [];
-      if (chosenSide(u.openid)) return [];                  // 已选过队 → 忽略重复选队（不重复刷永久推力）
-      setSide(u.openid, side);
-      return [{ side, key: 'join', count: 1, ...u }];
+    case 'team_select': {                                   // 原生选队：首次→落座加入;已落座→归原队只加力(不换、不重复刷)
+      const raw = sideFromTeam(payload);
+      if (!raw) return [];
+      const first = !chosenSide(u.openid);
+      const side = lockSide(u.openid, raw);                  // 首次→按选的队落座并锁;已落座→归原队
+      return [{ side, key: first ? 'join' : 'c666', count: 1, ...u }];
     }
     default: return [];
   }
@@ -178,4 +199,4 @@ function translate(msgType, payload, defaultSide) {
 
 function clampInt(v, lo, hi) { v = parseInt(v, 10); if (!Number.isFinite(v)) v = lo; return Math.max(lo, Math.min(v, hi)); }
 
-module.exports = { verifySign, translate, setSide, sideOf, chosenSide, giftToKey, GIFT_ID_TO_KEY, userOf };
+module.exports = { verifySign, translate, setSide, sideOf, chosenSide, lockSide, clearSides, giftToKey, GIFT_ID_TO_KEY, userOf };

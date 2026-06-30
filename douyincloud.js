@@ -106,6 +106,7 @@ async function startGame(headers, body) {
     } else log('token 置换失败（端点/有效期？）');
   }
   log('开局', ctx.roomId, ctx.nickName);
+  dy.clearSides();                                       // 每局重新拉队：清空上一局的落座锁定（与客户端 reset 清永久推力对齐）
   if (ctx.anchorOpenId) lastAnchorOpenId = ctx.anchorOpenId;     // 供下行 pushToClient / 战绩用
   if (ctx.roomId) await startTasks(ctx.roomId);
   if (ctx.roomId) rank.startRound(ctx.roomId);          // 本局榜：开局

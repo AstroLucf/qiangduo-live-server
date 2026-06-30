@@ -189,7 +189,7 @@ const server = http.createServer(async (req, res) => {
   if ((path === '/round/start' || path === '/round/end') && req.method === 'POST') {
     let body = {}; try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
     const roomId = body.room_id || lastRoomId;
-    if (path === '/round/start') { rank.startRound(roomId); return json(res, 200, { ok: true, roomId }); }
+    if (path === '/round/start') { dy.clearSides(); rank.startRound(roomId); return json(res, 200, { ok: true, roomId }); }
     const winner = body.winner === 'left' || body.winner === 'right' ? body.winner : 'tie';
     rank.endRound(roomId, winner);
     return json(res, 200, { ok: true, roomId, winner });
