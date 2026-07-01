@@ -245,6 +245,12 @@ const server = http.createServer(async (req, res) => {
     console.log(`[team] 观众选队 → ${JSON.stringify(out.data)}`);
     return json(res, 200, out);
   }
+  // 观众进出房数据（专门接口·后续用于召集/老玩家/贡献梯度）：当前接收 + ack + 日志留存
+  if (path === '/audience_change' && req.method === 'POST') {
+    const raw = await readBody(req);
+    console.log(`[room] 观众进出房 ${(raw || '').slice(0, 160)}`);
+    return json(res, 200, ut.audienceChange(raw));
+  }
   // 能力自检：确认「服务在抖音云内网 + WS/OpenAPI 能力开没开」。GET 先看可达性；POST {token} 看能力 err_no。
   if (path === '/selfcheck') {
     let token = u.searchParams.get('token') || '';

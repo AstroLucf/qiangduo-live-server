@@ -61,4 +61,12 @@ function userGroupPush(rawBody, round, broadcast) {
   };
 }
 
-module.exports = { queryUserGroup, userGroupPush, normGroup };
+// 观众进出房数据（专门接口·后续用于召集/老玩家识别/贡献梯度）：当前接收 + ack + 日志留存，
+// 不产生游戏效果。字段以真机为准（open_id、是否弹幕玩法老玩家、直播贡献梯度、发起召集用户 openid 等）。
+// TODO 后续：发起召集 openid → 触发召集效果；老玩家/高贡献 → 差异化欢迎横幅。
+function audienceChange(rawBody) {
+  let body = {}; try { body = JSON.parse(rawBody || '{}'); } catch (_) {}
+  return { errcode: 0, errmsg: 'success', data: {} };
+}
+
+module.exports = { queryUserGroup, userGroupPush, audienceChange, normGroup };
