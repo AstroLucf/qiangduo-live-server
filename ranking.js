@@ -117,14 +117,16 @@ async function uploadUserGroup(openId, groupId, roomId) {
 // 诊断(临时·用完删):手动打三个 API 看真实 err_no —— 查 secret/权限/参数到底卡哪。不受 ENABLED 门控。
 async function selfTestTeam(roomId, anchorOpenId) {
   const anchor = anchorOpenId || ANCHOR_OPEN_ID;
+  const uid = anchorOpenId || 'selftest_user';    // upload 的 open_id 也用传入的真 openid
   const rid = nowSec();
-  const out = { appSecretSet: !!APP_SECRET, enabled: ENABLED, anchor: anchor ? anchor.slice(0, 10) : '(空)', app_id: APP_ID };
-  try { const r = await call('round/sync_status', { app_id: APP_ID, anchor_open_id: anchor, room_id: roomId, round_id: rid, start_time: rid, status: 1 }); out.sync_start = { err_no: r.err_no, err_msg: r.err_msg }; }
-  catch (e) { out.sync_start = { error: e.message }; }
-  try { const r = await call('round/upload_user_group_info', { app_id: APP_ID, open_id: 'selftest_user', group_id: 'left', room_id: roomId, round_id: rid }); out.upload = { errcode: r.errcode, err_no: r.err_no, err_msg: r.err_msg || r.errmsg }; }
-  catch (e) { out.upload = { error: e.message }; }
-  try { const r = await call('round/sync_status', { app_id: APP_ID, anchor_open_id: anchor, room_id: roomId, round_id: rid, start_time: rid, end_time: nowSec(), status: 2, group_result_list: [{ group_id: 'left', result: 1 }, { group_id: 'right', result: 2 }] }); out.sync_end = { err_no: r.err_no, err_msg: r.err_msg }; }
-  catch (e) { out.sync_end = { error: e.message }; }
+  const out = { appSecretSet: !!APP_SECRET, enabled: ENABLED, anchor: anchor ? anchor.slice(0, 10) : '(空)', app_id: APP_ID, tokenHead: '' };
+  try { const t = await getToken(); out.tokenHead = (t || '').slice(0, 12) + '…'; } catch (e) { out.tokenHead = 'TOKEN_ERR: ' + e.message; }
+  try { const r = await call('round/sync_status', { app_id: APP_ID, anchor_open_id: anchor, room_id: roomId, round_id: rid, start_time: rid, status: 1 }); out.sync_start = JSON.stringify(r); }
+  catch (e) { out.sync_start = 'ERR: ' + e.message; }
+  try { const r = await call('round/upload_user_group_info', { app_id: APP_ID, open_id: uid, group_id: 'left', room_id: roomId, round_id: rid }); out.upload = JSON.stringify(r); }
+  catch (e) { out.upload = 'ERR: ' + e.message; }
+  try { const r = await call('round/sync_status', { app_id: APP_ID, anchor_open_id: anchor, room_id: roomId, round_id: rid, start_time: rid, end_time: nowSec(), status: 2, group_result_list: [{ group_id: 'left', result: 1 }, { group_id: 'right', result: 2 }] }); out.sync_end = JSON.stringify(r); }
+  catch (e) { out.sync_end = 'ERR: ' + e.message; }
   return out;
 }
 
