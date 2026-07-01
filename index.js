@@ -220,7 +220,7 @@ const server = http.createServer(async (req, res) => {
   if (path === '/selfcheck') {
     let token = u.searchParams.get('token') || '';
     if (!token && req.method === 'POST') { try { token = (JSON.parse((await readBody(req)) || '{}')).token || ''; } catch (_) {} }
-    return json(res, 200, { ok: true, check: await dyc.selfCheck(token) });
+    return json(res, 200, { ok: true, check: await dyc.selfCheck(token, u.searchParams.get('env') || '', u.searchParams.get('service') || '') });
   }
 
   // 本机 mock（step3 自测）：POST /mock/gift?side=left&key=donut&count=1

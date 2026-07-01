@@ -178,8 +178,9 @@ async function getConnId(token) {
 //   · reachable:false（ENOTFOUND/timeout）→ 服务没跑在抖音云内网 或 env_id/service_id 配错；
 //   · reachable:true 且 err_no≠0     → host 通但「能力未开通」或「token 无效」（看 err_msg 区分）；
 //   · reachable:true 且 err_no==0     → 该能力已开通、链路通。
-async function selfCheck(token) {
-  const env = { service_id: process.env.PK_SERVICE_ID || '1m3ugms2xb6sj', env_id: process.env.PK_ENV_ID || 'env-EHxqcRUgjW' };
+async function selfCheck(token, envId, serviceId) {
+  // envId/serviceId 可由调用方覆盖 → 同一部署里测不同环境(dev env-EHxqcRUgjW / prod env-fOcGB32zcl)的能力权限。
+  const env = { service_id: serviceId || process.env.PK_SERVICE_ID || '1m3ugms2xb6sj', env_id: envId || process.env.PK_ENV_ID || 'env-EHxqcRUgjW' };
   const out = { env, tokenGiven: !!token };
   try {
     const r = await postInternal(WS_GATEWAY, '/ws/get_conn_id', { service_id: env.service_id, env_id: env.env_id, token: token || '' });
