@@ -44,8 +44,13 @@ function userGroupPush(rawBody, round, broadcast) {
   let body = {}; try { body = JSON.parse(rawBody || '{}'); } catch (_) {}
   const openId = body.open_id || '';
   const want = normGroup(body.group_id);
+  // 防御：只处理带有效阵营(group_id)的「观众选择阵营」。无 group_id 的事件——
+  // 如误配到本地址的「观众进出房数据」——直接 ack、不落座，避免观众一进房就被随机拉队/刷屏。
+  if (!want) {
+    return { errcode: 0, errmsg: 'success', data: { round_id: round.id || 0, round_status: round.status || 2, group_id: dy.chosenSide(openId) || '' } };
+  }
   const first = !dy.chosenSide(openId);
-  const side = dy.lockSide(openId, want || undefined);   // 首次→按选的落座并锁；已落座→归原队
+  const side = dy.lockSide(openId, want);                 // 首次→按选的落座并锁；已落座→归原队
   if ((side === 'left' || side === 'right') && typeof broadcast === 'function') {
     const user = { openid: openId, nickname: body.nickname || '', avatar: body.avatar_url || '' };
     broadcast([{ side, key: first ? 'join' : 'c666', count: 1, ...user }]);
