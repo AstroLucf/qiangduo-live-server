@@ -103,6 +103,17 @@ function rankList(map) {
 function chunk(arr, n) { const o = []; for (let i = 0; i < arr.length; i += n) o.push(arr.slice(i, i + n)); return o; }
 const nowSec = () => Math.floor(Date.now() / 1000);
 
+// 用户快捷选队②:上报观众阵营(gaming_con/round/upload_user_group_info·观众加入阵营时调)。
+// group_id=side(left/right·与后台 Group_ID 一致);round_id 取当前对局(无则 nowSec 兜)。无 secret 静默降级。
+async function uploadUserGroup(openId, groupId, roomId) {
+  if (!ENABLED || !openId || (groupId !== 'left' && groupId !== 'right')) return;
+  const R = roomId && rounds.get(roomId);
+  const roundId = R ? R.roundId : nowSec();
+  try {
+    await call('round/upload_user_group_info', { app_id: APP_ID, open_id: openId, group_id: groupId, room_id: roomId || '', round_id: roundId });
+  } catch (e) { log('uploadUserGroup 失败', e.message); }
+}
+
 // ---------- 本局榜编排 ----------
 async function startRound(roomId) {
   if (!ENABLED || !roomId) return;
@@ -200,7 +211,7 @@ function stopWorldCron() { if (_cron) { clearInterval(_cron); _cron = null; } }
 
 module.exports = {
   enabled: ENABLED,
-  recordGift, startRound, endRound,
+  recordGift, startRound, endRound, uploadUserGroup,
   worldEnsureVersion, worldTick, startWorldCron, stopWorldCron,
   _state: { rounds, world },     // 自测用
 };
