@@ -172,4 +172,28 @@ async function getConnId(token) {
   } catch (e) { log('getConnId 异常', e.message); return ''; }
 }
 
-module.exports = { startGame, liveDataCallback, websocketCallback, finishGame, pushToClient, startTasks, getConnId, getLiveInfo, getAnchorOpenId: () => lastAnchorOpenId };
+// ── 能力自检：不落地任何状态，只探测「服务在不在抖音云内网 + WS/OpenAPI 能力开没开」──
+// 本地跑必然 reachable:false（内网 host 只在抖音云解析）→ 必须部署后在抖音云上访问才有意义。
+// 用法：GET /api/selfcheck 先看内网可达性；POST /api/selfcheck {token} 带真 token 看能力 err_no。
+//   · reachable:false（ENOTFOUND/timeout）→ 服务没跑在抖音云内网 或 env_id/service_id 配错；
+//   · reachable:true 且 err_no≠0     → host 通但「能力未开通」或「token 无效」（看 err_msg 区分）；
+//   · reachable:true 且 err_no==0     → 该能力已开通、链路通。
+async function selfCheck(token) {
+  const env = { service_id: process.env.PK_SERVICE_ID || '1m3ugms2xb6sj', env_id: process.env.PK_ENV_ID || 'env-EHxqcRUgjW' };
+  const out = { env, tokenGiven: !!token };
+  try {
+    const r = await postInternal(WS_GATEWAY, '/ws/get_conn_id', { service_id: env.service_id, env_id: env.env_id, token: token || '' });
+    out.wsGateway = { host: WS_GATEWAY, reachable: true, err_no: r.err_no, err_msg: r.err_msg || '', hasConnId: !!r.data };
+  } catch (e) { out.wsGateway = { host: WS_GATEWAY, reachable: false, error: e.message }; }
+  try {
+    const info = await postInternal(OPENAPI_HOST, '/api/webcastmate/info', { token: token || '' });
+    out.openapi = { host: OPENAPI_HOST, reachable: true, err_no: info.err_no, err_msg: info.err_msg || '', hasData: !!info.data };
+  } catch (e) { out.openapi = { host: OPENAPI_HOST, reachable: false, error: e.message }; }
+  out.verdict = out.wsGateway.reachable === false
+    ? '❌ WS 网关 host 不可达 → 服务没跑在抖音云内网 / env 配错（本地跑必然如此，须在抖音云上访问）'
+    : (out.wsGateway.err_no ? ('⚠️ host 通但 err_no=' + out.wsGateway.err_no + ' → 多半「能力未开通」或「token 无效」：' + (out.wsGateway.err_msg || ''))
+                            : '✅ get_conn_id 通（长连接下行能力已开）');
+  return out;
+}
+
+module.exports = { startGame, liveDataCallback, websocketCallback, finishGame, pushToClient, startTasks, getConnId, getLiveInfo, selfCheck, getAnchorOpenId: () => lastAnchorOpenId };
