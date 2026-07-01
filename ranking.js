@@ -115,13 +115,14 @@ async function uploadUserGroup(openId, groupId, roomId) {
 }
 
 // ---------- 本局榜编排 ----------
-async function startRound(roomId) {
+async function startRound(roomId, anchorOpenId) {
   if (!ENABLED || !roomId) return;
+  const anchor = anchorOpenId || ANCHOR_OPEN_ID;  // 当前对局主播 openid（start_game 用主播 token 动态换出）·env 仅兜底
   const roundId = nowSec();                       // round_id 同房间内递增，用开局时间戳（文档建议）
-  rounds.set(roomId, { roundId, startTime: roundId, users: new Map() });
+  rounds.set(roomId, { roundId, startTime: roundId, users: new Map(), anchor });
   try {
-    await call('round/sync_status', { app_id: APP_ID, anchor_open_id: ANCHOR_OPEN_ID, room_id: roomId, round_id: roundId, start_time: roundId, status: 1 });
-    log('对局开始', roomId, '#' + roundId);
+    await call('round/sync_status', { app_id: APP_ID, anchor_open_id: anchor, room_id: roomId, round_id: roundId, start_time: roundId, status: 1 });
+    log('对局开始', roomId, '#' + roundId, '主播', (anchor || '(空)').slice(0, 8));
   } catch (e) { log('startRound 失败', e.message); }
 }
 
@@ -135,6 +136,7 @@ async function endRound(roomId, winnerSide) {
   if (!ENABLED) return;
   const R = rounds.get(roomId);
   if (!R) { log('endRound: 无活动对局', roomId); return; }
+  const anchor = R.anchor || ANCHOR_OPEN_ID;      // 用开局存的该场主播 openid·env 兜底
   const end = nowSec();
   const ranked = rankList(R.users);
   const userItems = ranked.map((u) => ({
@@ -148,15 +150,15 @@ async function endRound(roomId, winnerSide) {
   ];
   try {
     // 1) 同步对局结束（带阵营结果）
-    await call('round/sync_status', { app_id: APP_ID, anchor_open_id: ANCHOR_OPEN_ID, room_id: roomId, round_id: R.roundId, start_time: R.startTime, end_time: end, status: 2, group_result_list: groupResult });
+    await call('round/sync_status', { app_id: APP_ID, anchor_open_id: anchor, room_id: roomId, round_id: R.roundId, start_time: R.startTime, end_time: end, status: 2, group_result_list: groupResult });
     // 2) 个人数据区：全部参与者，分批 ≤50
     for (const part of chunk(userItems, USER_BATCH)) {
-      await call('round/upload_user_result', { app_id: APP_ID, anchor_open_id: ANCHOR_OPEN_ID, room_id: roomId, round_id: R.roundId, user_list: part });
+      await call('round/upload_user_result', { app_id: APP_ID, anchor_open_id: anchor, room_id: roomId, round_id: R.roundId, user_list: part });
     }
     // 3) 榜单区：Top150（已排序）
-    await call('round/upload_rank_list', { app_id: APP_ID, anchor_open_id: ANCHOR_OPEN_ID, room_id: roomId, round_id: R.roundId, rank_list: userItems.slice(0, RANK_TOP) });
+    await call('round/upload_rank_list', { app_id: APP_ID, anchor_open_id: anchor, room_id: roomId, round_id: R.roundId, rank_list: userItems.slice(0, RANK_TOP) });
     // 4) 标记完成 → 小摇杆「本局榜」展示
-    await call('round/complete_upload_user_result', { app_id: APP_ID, anchor_open_id: ANCHOR_OPEN_ID, room_id: roomId, round_id: R.roundId, complete_time: nowSec() });
+    await call('round/complete_upload_user_result', { app_id: APP_ID, anchor_open_id: anchor, room_id: roomId, round_id: R.roundId, complete_time: nowSec() });
     log('对局结束上报完成', roomId, '#' + R.roundId, '参与', userItems.length, '胜方', winnerSide);
   } catch (e) { log('endRound 失败', e.message); }
 

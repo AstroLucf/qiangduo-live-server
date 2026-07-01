@@ -208,7 +208,7 @@ const server = http.createServer(async (req, res) => {
   if ((path === '/round/start' || path === '/round/end') && req.method === 'POST') {
     let body = {}; try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
     const roomId = body.room_id || lastRoomId;
-    if (path === '/round/start') { dy.clearSides(); rank.startRound(roomId); currentRound = { id: currentRound.id + 1, status: 1 }; return json(res, 200, { ok: true, roomId, roundId: currentRound.id }); }
+    if (path === '/round/start') { dy.clearSides(); rank.startRound(roomId, dyc.getAnchorOpenId()); currentRound = { id: currentRound.id + 1, status: 1 }; return json(res, 200, { ok: true, roomId, roundId: currentRound.id }); }
     const winner = body.winner === 'left' || body.winner === 'right' ? body.winner : 'tie';
     rank.endRound(roomId, winner);
     currentRound.status = 2;

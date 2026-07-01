@@ -109,7 +109,7 @@ async function startGame(headers, body) {
   dy.clearSides();                                       // 每局重新拉队：清空上一局的落座锁定（与客户端 reset 清永久推力对齐）
   if (ctx.anchorOpenId) lastAnchorOpenId = ctx.anchorOpenId;     // 供下行 pushToClient / 战绩用
   if (ctx.roomId) await startTasks(ctx.roomId);
-  if (ctx.roomId) rank.startRound(ctx.roomId);          // 本局榜：开局
+  if (ctx.roomId) rank.startRound(ctx.roomId, ctx.anchorOpenId);   // 传该场主播 openid(动态·非固定 env)          // 本局榜：开局
   return ctx;
 }
 
