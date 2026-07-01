@@ -129,6 +129,15 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { ok: true, instance: INSTANCE_ID, bootAt: BOOT_AT, clients: clients.size, sseSeen, appid: cfg.APPID, skipSign: cfg.DEV_SKIP_SIGN, defaultSide: cfg.DEFAULT_SIDE });
   }
 
+  // 诊断：最近广播的事件（自查工具/真机推送后，看服务端翻译+广播了什么——即使没有游戏连着也能看）。
+  if (path === '/recent') {
+    const recent = recentEvents.slice(-40).map((e) => {
+      let events = []; try { const m = e.frame.match(/data: (.+)/); if (m) events = JSON.parse(m[1]); } catch (_) {}
+      return { seq: e.seq, events };
+    });
+    return json(res, 200, { ok: true, instance: INSTANCE_ID, eventSeq, buffered: recentEvents.length, clients: clients.size, recent });
+  }
+
   // SSE：客户端订阅下行数值
   if (path === '/events' && req.method === 'GET') {
     cors(res);
