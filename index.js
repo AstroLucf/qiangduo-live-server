@@ -253,6 +253,10 @@ const server = http.createServer(async (req, res) => {
     console.log(`[room] 观众进出房 ${(raw || '').slice(0, 160)}`);
     return json(res, 200, ut.audienceChange(raw));
   }
+  // 诊断(临时):手动打选队三 API 看真实 err_no。GET /api/selftest_team?anchor=<主播openid>
+  if (path === '/selftest_team') {
+    return json(res, 200, { ok: true, test: await rank.selfTestTeam(u.searchParams.get('room') || '1100000000000000888', u.searchParams.get('anchor') || '') });
+  }
   // 能力自检：确认「服务在抖音云内网 + WS/OpenAPI 能力开没开」。GET 先看可达性；POST {token} 看能力 err_no。
   if (path === '/selfcheck') {
     let token = u.searchParams.get('token') || '';
