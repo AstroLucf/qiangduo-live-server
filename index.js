@@ -15,6 +15,12 @@ const dy = require('./douyin');
 const rank = require('./ranking');
 const dyc = require('./douyincloud');     // 抖音云生产接入层（真机：内网回调 + WS 网关下行）
 
+// ── 实例指纹：FaaS 会把服务复制成多个实例分摊流量。每个实例进程启动时生成唯一 ID。
+//    连续刷 /health 若看到多个不同 instance → 多实例（这正是 SSE 0 端的根：连接与回调落不同实例）。
+const INSTANCE_ID = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+const BOOT_AT = new Date().toISOString();
+let sseSeen = 0;             // 本实例累计见过的 SSE 接入次数（跨实例不共享，仅本实例计数）
+
 const clients = new Set();   // 当前 SSE 连接
 let lastRoomId = '';         // 最近一次回调的 room_id（/round/* 缺省用它）
 
@@ -120,7 +126,7 @@ const server = http.createServer(async (req, res) => {
 
   // 健康检查
   if (path === '/health') {
-    return json(res, 200, { ok: true, clients: clients.size, appid: cfg.APPID, skipSign: cfg.DEV_SKIP_SIGN, defaultSide: cfg.DEFAULT_SIDE });
+    return json(res, 200, { ok: true, instance: INSTANCE_ID, bootAt: BOOT_AT, clients: clients.size, sseSeen, appid: cfg.APPID, skipSign: cfg.DEV_SKIP_SIGN, defaultSide: cfg.DEFAULT_SIDE });
   }
 
   // SSE：客户端订阅下行数值
@@ -140,7 +146,7 @@ const server = http.createServer(async (req, res) => {
       for (const e of miss) { try { res.write(e.frame); } catch (_) {} }
       if (miss.length) console.log(`[sse] 重连补发 ${miss.length} 条 (Last-Event-ID=${lastId})`);
     }
-    clients.add(res);
+    clients.add(res); sseSeen++;
     const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch (_) {} }, 15000);
     // 主动 50s 优雅关闭：早于网关 ~60s 强制掐断，让客户端在可控时机收正常 EOF 后按 retry 重连，
     // 间隙更短更稳；配合上面的补发 → 跨重连零丢失。
