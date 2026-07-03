@@ -34,6 +34,7 @@ let currentRound = { id: 0, status: 2 };   // 当前对局（供「用户快捷�
 let eventSeq = 0;                    // 全局单调递增事件序号（= SSE id）
 const recentEvents = [];             // 环形缓冲：[{ seq, frame }]，最近 REPLAY_MAX 条已广播事件
 const REPLAY_MAX = 256;              // 容量：60s 内礼物远不及此；超出则最老的丢（极端积压才触顶）
+const recentRawGifts = [];           // 诊断：最近原始礼物 [{sec_gift_id, gift_value, key, nick}]，供 /rawgifts 回填 GIFT_ID_TO_KEY
 
 // ── 开发期同源静态托管 + 沙盒测试台（cfg.SERVE_STATIC=1；云端不开，故 / 仍是健康探针）──
 const fs = require('fs');
@@ -130,7 +131,10 @@ const server = http.createServer(async (req, res) => {
 
   // 健康检查
   if (path === '/health') {
-    return json(res, 200, { ok: true, instance: INSTANCE_ID, bootAt: BOOT_AT, clients: clients.size, sseSeen, appid: cfg.APPID, skipSign: cfg.DEV_SKIP_SIGN, defaultSide: cfg.DEFAULT_SIDE });
+    // giftMap：部署校验用——重新部署后 curl /api/health，giftMap.battery=true 且 keys=6 = 新代码已上线（电池已精确映射）。
+    const gm = dy.GIFT_ID_TO_KEY || {};
+    const giftMap = { rev: '2026-07-02-battery-fixed', keys: Object.keys(gm).length, battery: Object.values(gm).includes('battery') };
+    return json(res, 200, { ok: true, instance: INSTANCE_ID, bootAt: BOOT_AT, clients: clients.size, sseSeen, appid: cfg.APPID, skipSign: cfg.DEV_SKIP_SIGN, defaultSide: cfg.DEFAULT_SIDE, giftMap });
   }
 
   // 诊断：最近广播的事件（自查工具/真机推送后，看服务端翻译+广播了什么——即使没有游戏连着也能看）。
@@ -140,6 +144,16 @@ const server = http.createServer(async (req, res) => {
       return { seq: e.seq, events };
     });
     return json(res, 200, { ok: true, instance: INSTANCE_ID, eventSeq, buffered: recentEvents.length, clients: clients.size, recent });
+  }
+
+  // 诊断：最近原始礼物身份（送一次礼物后开此网址，直接读 sec_gift_id 回填 douyin.js 的 GIFT_ID_TO_KEY）。
+  // 用途：审核抓「能量电池→空投」这类漏配 → 送一个电池 → 这里找 gift_value=99 那条 → 复制 sec_gift_id。
+  if (path === '/rawgifts') {
+    return json(res, 200, {
+      ok: true, instance: INSTANCE_ID,
+      hint: '找 key 与礼物不符的那条（如送电池却 key=airdrop），复制其 sec_gift_id 回填 douyin.js GIFT_ID_TO_KEY',
+      gifts: recentRawGifts.slice(-30),
+    });
   }
 
   // SSE：客户端订阅下行数值
@@ -196,6 +210,9 @@ const server = http.createServer(async (req, res) => {
       if (msgType === 'live_gift') {
         const openId = dy.userOf(item).openid;
         rank.recordGift({ openId, side: dy.sideOf(openId, cfg.DEFAULT_SIDE), value: item.gift_value || item.diamond, roomId: roomId || lastRoomId });
+        // 诊断：记原始礼物身份 → /rawgifts 一键读 sec_gift_id 回填映射表（尤其审核抓的漏配礼物）
+        recentRawGifts.push({ sec_gift_id: item.sec_gift_id || '', gift_value: item.gift_value ?? item.diamond ?? null, key: evs[0] ? evs[0].key : '(丢弃)', nick: (evs[0] && evs[0].nickname) || dy.userOf(item).nickname || '' });
+        if (recentRawGifts.length > 30) recentRawGifts.shift();
       }
     }
     broadcast(events);

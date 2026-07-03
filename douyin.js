@@ -18,15 +18,23 @@ const GIFT_ID_TO_KEY = {
   'PJ0FFeaDzXUreuUBZH6Hs+b56Jh0tQjrq0bIrrlZmv13GSAL9Q1hf59fjGk=': 'donut',   // 甜甜圈 52抖币
   'YbLESoUj053FWVYPWUNOAtp4FYnb+/eZbyrLi7ndArVFz14rivgxf0cFrKs=': 'mic',     // 派对话筒 299抖币
   'pGLo7HKNk1i4djkicmJXf6iWEyd+pfPBjbsHmd3WcX0Ierm2UdnRR7UINvI=': 'airdrop', // 神秘空投 520抖币
+  'IkkadLfz7O/a5UR45p/OOCCG6ewAWVbsuzR/Z+v1v76CBU+mTG/wPjqdpfg=': 'battery', // 能量电池 99抖币（2026-07-02 后台礼物表补齐，修「电池→空投」审核驳回）
 };
-// 【兜底】按抖币价就近归档（取“价 ≤ 礼物价值”里的最高档）。
-// ⚠ gift_value/diamond 的单位（抖币? 分?）待沙盒真实样例确认；置顶映射可彻底绕开此兜底。
+// 【兜底·仅无 sec_gift_id 时】按抖币价就近归档。用于自查/沙盒工具（送干净 gift_value、不带 sec_gift_id）。
+// ⚠ gift_value/diamond 的单位（抖币? 分?）在真机不可信 → 真机一律不走这条（见 giftToKey 分流）。
 const PRICE_TIERS = [
   [520, 'airdrop'], [299, 'mic'], [99, 'battery'],
   [52, 'donut'], [10, 'pill'], [1, 'wand'],
 ];
 function giftToKey({ sec_gift_id, diamond }) {
   if (sec_gift_id && GIFT_ID_TO_KEY[sec_gift_id]) return GIFT_ID_TO_KEY[sec_gift_id];
+  // 真机带 sec_gift_id 却没命中 = 未登记礼物（6 个付费礼物已全部精确映射，正常到不了这）。
+  // 保守兜底：只落最低档 wand + 响亮告警，绝不按不可信的 gift_value 放大成大礼物（审核雷）。
+  if (sec_gift_id) {
+    console.warn(`[GIFT-UNMAPPED] sec_gift_id=${sec_gift_id} gift_value=${diamond} → 保守兜底 wand（未登记礼物!请补进 GIFT_ID_TO_KEY）`);
+    return 'wand';
+  }
+  // 无 sec_gift_id（自查/沙盒按 gift_value 模拟送）→ 干净数值可靠，走按价兜底。
   const v = Number(diamond) || 0;
   for (const [p, k] of PRICE_TIERS) if (v >= p) return k;
   return 'wand';                              // 最低档兜底
