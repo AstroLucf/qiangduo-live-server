@@ -61,11 +61,29 @@ function userGroupPush(rawBody, round, broadcast) {
   };
 }
 
-// 观众进出房数据（专门接口·后续用于召集/老玩家识别/贡献梯度）：当前接收 + ack + 日志留存，
-// 不产生游戏效果。字段以真机为准（open_id、是否弹幕玩法老玩家、直播贡献梯度、发起召集用户 openid 等）。
+// 观众进出房数据（专门接口）：进场时若该观众在**世界榜前十** → 广播 {type:'rankEnter',rank} 到游戏，
+// 客户端播对应名次入场视频（横屏·上下黑边渐变·8 秒）。非前十/查不到名次 → 只 ack 不播。
+// 字段以真机为准（open_id、是否弹幕玩法老玩家、直播贡献梯度、发起召集用户 openid 等）。
 // TODO 后续：发起召集 openid → 触发召集效果；老玩家/高贡献 → 差异化欢迎横幅。
-function audienceChange(rawBody) {
+const rankEnterCooldown = new Map();          // openid -> lastMs（同一前十观众 60s 内反复进场，只显示第一次动画）
+const RANK_ENTER_COOLDOWN_MS = 60000;         // 60s 去抖
+function audienceChange(rawBody, broadcast, worldRankOf) {
   let body = {}; try { body = JSON.parse(rawBody || '{}'); } catch (_) {}
+  const openId = body.open_id || body.openid || body.sec_openid || '';
+  // 只处理「进场」：字段名以真机为准，容错 action/event/type 里含 enter/in；缺字段则默认按进场处理。
+  const act = String(body.action || body.event || body.event_type || body.type || '').toLowerCase();
+  const isEnter = !act || /enter|join|in\b|come/.test(act);
+  if (openId && isEnter && typeof broadcast === 'function' && typeof worldRankOf === 'function') {
+    const rank = worldRankOf(openId);
+    if (rank >= 1 && rank <= 10) {
+      const now = Date.now();
+      const last = rankEnterCooldown.get(openId) || 0;
+      if (now - last > RANK_ENTER_COOLDOWN_MS) {   // 60s 内同一人反复进场 → 只第一次播
+        rankEnterCooldown.set(openId, now);
+        broadcast([{ type: 'rankEnter', rank, openid: openId, nickname: body.nickname || '', avatar: body.avatar_url || body.avatar || '' }]);
+      }
+    }
+  }
   return { errcode: 0, errmsg: 'success', data: {} };
 }
 

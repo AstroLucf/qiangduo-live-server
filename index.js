@@ -264,11 +264,11 @@ const server = http.createServer(async (req, res) => {
     console.log(`[team] 观众选队 → ${JSON.stringify(out.data)}`);
     return json(res, 200, out);
   }
-  // 观众进出房数据（专门接口·后续用于召集/老玩家/贡献梯度）：当前接收 + ack + 日志留存
+  // 观众进出房数据（专门接口）：世界榜前十观众进场 → 广播 rankEnter → 客户端播对应名次入场视频
   if (path === '/audience_change' && req.method === 'POST') {
     const raw = await readBody(req);
     console.log(`[room] 观众进出房 ${(raw || '').slice(0, 160)}`);
-    return json(res, 200, ut.audienceChange(raw));
+    return json(res, 200, ut.audienceChange(raw, broadcast, rank.worldRankOf));
   }
   // 诊断(临时):手动打选队三 API 看真实 err_no。GET /api/selftest_team?anchor=<主播openid>
   if (path === '/selftest_team') {

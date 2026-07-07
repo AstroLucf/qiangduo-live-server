@@ -103,6 +103,15 @@ function rankList(map) {
 function chunk(arr, n) { const o = []; for (let i = 0; i < arr.length; i += n) o.push(arr.slice(i, i + n)); return o; }
 const nowSec = () => Math.floor(Date.now() / 1000);
 
+// 查某 open_id 在世界榜(world 跨场累计)的名次(1-based)；不在榜返回 0。用于观众进场判定「世界榜前十」。
+// ⚠ world 是进程内存·多实例不共享·重启即丢（同联调清单）→ 进场判定同样受限，放量须随 world 一起上 KV。
+function worldRankOf(openId) {
+  if (!ENABLED || !openId || !world.has(openId)) return 0;
+  const ranked = rankList(world);
+  const idx = ranked.findIndex((u) => u.openId === openId);
+  return idx < 0 ? 0 : idx + 1;
+}
+
 // 用户快捷选队②:上报观众阵营(gaming_con/round/upload_user_group_info·观众加入阵营时调)。
 // group_id=side(left/right·与后台 Group_ID 一致);round_id 取当前对局(无则 nowSec 兜)。无 secret 静默降级。
 async function uploadUserGroup(openId, groupId, roomId) {
@@ -230,7 +239,7 @@ function stopWorldCron() { if (_cron) { clearInterval(_cron); _cron = null; } }
 module.exports = {
   enabled: ENABLED,
   recordGift, startRound, endRound, uploadUserGroup, selfTestTeam,
-  worldEnsureVersion, worldTick, startWorldCron, stopWorldCron,
+  worldEnsureVersion, worldTick, startWorldCron, stopWorldCron, worldRankOf,
   _state: { rounds, world },     // 自测用
 };
 
