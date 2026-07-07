@@ -67,6 +67,9 @@ function userGroupPush(rawBody, round, broadcast) {
 // TODO 后续：发起召集 openid → 触发召集效果；老玩家/高贡献 → 差异化欢迎横幅。
 const rankEnterCooldown = new Map();          // openid -> lastMs（同一前十观众 60s 内反复进场，只显示第一次动画）
 const RANK_ENTER_COOLDOWN_MS = 60000;         // 60s 去抖
+// 🔧 测试开关：env RANK_ENTER_TEST=<1-10> → 每个进场观众都强制当该名次触发入场视频（免真送礼凑榜、免 60s 去抖）。
+//    测完把这个环境变量删掉即恢复"真·世界榜前十才播"。0/未设 = 关闭。
+const RANK_ENTER_TEST = parseInt(process.env.RANK_ENTER_TEST || '0', 10);
 function audienceChange(rawBody, broadcast, worldRankOf) {
   // ⚠ 真机回调 raw 是数组 [{...}]（同 /cb/* 与礼物回调）→ 必须取 [0]！直接 body.open_id 会全取空、永不触发。
   let items; try { const p = JSON.parse(rawBody || '[]'); items = Array.isArray(p) ? p : [p]; } catch (_) { items = []; }
@@ -76,13 +79,14 @@ function audienceChange(rawBody, broadcast, worldRankOf) {
   const act = String(body.action || body.event || body.event_type || body.type || '').toLowerCase();
   const isEnter = !act || /enter|join|in\b|come/.test(act);
   if (openId && isEnter && typeof broadcast === 'function' && typeof worldRankOf === 'function') {
-    const rank = worldRankOf(openId);
+    const testMode = RANK_ENTER_TEST >= 1 && RANK_ENTER_TEST <= 10;
+    const rank = testMode ? RANK_ENTER_TEST : worldRankOf(openId);   // 测试开关开 → 强制名次；否则真查世界榜
     // 诊断：每个进场者的世界榜名次一眼可见（未上榜/非前十/触发 都打出来，方便排查为啥不播）
-    console.log(`[room→] 进场 openid=${String(openId).slice(0, 10)}… 世界榜名次=${rank || '未上榜(需先送礼累计)'} ${rank >= 1 && rank <= 10 ? '→ 触发榜' + rank + '入场视频' : '(非前十·不播)'}`);
+    console.log(`[room→] 进场 openid=${String(openId).slice(0, 10)}… 名次=${rank || '未上榜(需先送礼累计)'}${testMode ? '(测试强制)' : ''} ${rank >= 1 && rank <= 10 ? '→ 触发榜' + rank + '入场视频' : '(非前十·不播)'}`);
     if (rank >= 1 && rank <= 10) {
       const now = Date.now();
       const last = rankEnterCooldown.get(openId) || 0;
-      if (now - last > RANK_ENTER_COOLDOWN_MS) {   // 60s 内同一人反复进场 → 只第一次播
+      if (testMode || now - last > RANK_ENTER_COOLDOWN_MS) {   // 测试模式跳过去抖；正式态 60s 内同一人只第一次播
         rankEnterCooldown.set(openId, now);
         broadcast([{ type: 'rankEnter', rank, openid: openId, nickname: body.nickname || '', avatar: body.avatar_url || body.avatar || '' }]);
       } else {
