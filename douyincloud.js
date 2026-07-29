@@ -23,6 +23,9 @@ const cfg = require('./config');
 const APP_ID = cfg.APPID;
 const OPENAPI_HOST = 'webcast-bytedance-com.openapi.dyc.ivolces.com';  // 内网专线 OpenAPI：免 token/https
 const WS_GATEWAY = 'ws-push.dyc.ivolces.com';                          // 抖音云 WS 网关
+// ★service_id 兜底值 2026-07-30 由 1m3ugms2xb6sj 换成 1m98s3c3nfym8：原服务在抖音云上丢失，
+//   重建 qiangduo-live(容器·dev env-EHxqcRUgjW) 后拿到新 ID。服务一旦重建这个值就会变 ——
+//   正式部署请用环境变量 PK_SERVICE_ID 覆盖，别依赖这里的硬编码兜底。
 // 开局要开启的推送任务类型（选队等进阶类型的 msg_type 待「用户快捷选队」文档确认后补）
 const TASK_MSG_TYPES = ['live_gift', 'live_like', 'live_comment', 'live_fansclub'];
 let lastAnchorOpenId = '';   // 最近开局主播 openid（token 置换得到，供下行/战绩用）
@@ -166,7 +169,7 @@ async function finishGame(headers, rawBody) {
 async function getConnId(token) {
   try {
     const r = await postInternal(WS_GATEWAY, '/ws/get_conn_id',
-      { service_id: process.env.PK_SERVICE_ID || '1m3ugms2xb6sj', env_id: process.env.PK_ENV_ID || 'env-EHxqcRUgjW', token: token || '' });
+      { service_id: process.env.PK_SERVICE_ID || '1m98s3c3nfym8', env_id: process.env.PK_ENV_ID || 'env-EHxqcRUgjW', token: token || '' });
     if (r && r.data) { const d = typeof r.data === 'string' ? JSON.parse(r.data) : r.data; return d.conn_id || ''; }
     return '';
   } catch (e) { log('getConnId 异常', e.message); return ''; }
@@ -180,7 +183,7 @@ async function getConnId(token) {
 //   · reachable:true 且 err_no==0     → 该能力已开通、链路通。
 async function selfCheck(token, envId, serviceId) {
   // envId/serviceId 可由调用方覆盖 → 同一部署里测不同环境(dev env-EHxqcRUgjW / prod env-fOcGB32zcl)的能力权限。
-  const env = { service_id: serviceId || process.env.PK_SERVICE_ID || '1m3ugms2xb6sj', env_id: envId || process.env.PK_ENV_ID || 'env-EHxqcRUgjW' };
+  const env = { service_id: serviceId || process.env.PK_SERVICE_ID || '1m98s3c3nfym8', env_id: envId || process.env.PK_ENV_ID || 'env-EHxqcRUgjW' };
   const out = { env, tokenGiven: !!token };
   try {
     const r = await postInternal(WS_GATEWAY, '/ws/get_conn_id', { service_id: env.service_id, env_id: env.env_id, token: token || '' });
