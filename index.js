@@ -282,6 +282,12 @@ const server = http.createServer(async (req, res) => {
   }
 
   // 本机 mock（step3 自测）：POST /mock/gift?side=left&key=donut&count=1
+  // ★必须 ALLOW_MOCK=1 才放行（2026-07-30）：它能凭空造礼物、直接左右直播胜负。
+  //   关闭时返回 404 而不是 403 —— 不对外承认这个接口存在，少一个被试探的目标。
+  if (path === '/mock/gift' && req.method === 'POST' && !cfg.ALLOW_MOCK) {
+    console.warn('[MOCK-BLOCKED] 有人请求 /mock/gift 但 ALLOW_MOCK 未开 →', req.headers['x-forwarded-for'] || req.socket.remoteAddress || '?');
+    return json(res, 404, { ok: false, err: 'not found' });
+  }
   if (path === '/mock/gift' && req.method === 'POST') {
     const side = u.searchParams.get('side') || 'left';
     const key = u.searchParams.get('key') || 'donut';
@@ -304,7 +310,9 @@ server.listen(cfg.PORT, () => {
   console.log(`直播小玩法 本地服务端  ::${cfg.PORT}`);
   console.log(`  SSE   GET  /events`);
   console.log(`  回调  POST /cb/{gift,like,comment,team}`);
-  console.log(`  自测  POST /mock/gift?side=left&key=donut&count=1`);
+  console.log(cfg.ALLOW_MOCK
+    ? `  自测  POST /mock/gift?side=left&key=donut&count=1   ⚠ 已开放(ALLOW_MOCK=1)·公网可达时勿开`
+    : `  自测  /mock/gift 已关闭 → 需要时 ALLOW_MOCK=1 node server/index.js`);
   console.log(`  对局  POST /round/{start,end}    (本局榜/世界榜战绩上报)`);
   console.log(`  健康  GET  /health        (跳过验签=${cfg.DEV_SKIP_SIGN})`);
   console.log(`  战绩  ${rank.enabled ? '已启用 (AppSecret 已配, 世界榜30s定时刷新)' : '未启用 (配 DOUYIN_APPSECRET 环境变量后生效)'}`);
