@@ -73,7 +73,11 @@ async function call(path, body, _retried) {
   const token = await getToken();
   const r = await postJSON(API_HOST, API_PATH + path, body, { 'X-Token': token });
   if (r && r.err_no === 40004 && !_retried) { await getToken(true); return call(path, body, true); }
-  if (r && r.err_no !== 0) log('⚠️', path, 'err_no=' + r.err_no, r.err_msg || '');
+  // ★err_no 缺失 ≠ 出错（2026-07-30 修）：部分接口成功时压根不返回 err_no 字段，
+  //   旧写法 `undefined !== 0` 恒为真 → 每次成功都打一条 ⚠️ 假告警。
+  //   实测 world_rank/set_valid_version 就是这样：告警下一行紧跟着"世界榜生效版本 month_202607"（真成功了）。
+  //   联调期这种假告警最坑——它会把真正的错误淹掉，让人以为链路有问题。
+  if (r && r.err_no != null && r.err_no !== 0) log('⚠️', path, 'err_no=' + r.err_no, r.err_msg || '');
   return r;
 }
 
