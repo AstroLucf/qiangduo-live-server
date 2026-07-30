@@ -23,9 +23,21 @@ function normGroup(g) {
   return '';
 }
 
+// ★统一取包体（2026-07-30 加）：真机回调 raw 可能是【数组】[{...}] 也可能是对象 —— /cb/*、礼物回调、
+//   observer audience_change 实测都是数组，audienceChange 已为此修过一次（见其上方注释）。
+//   而 queryUserGroup/userGroupPush 原先直接 body.open_id，收到数组时会【全取空】：
+//     · queryUserGroup → 永远返回"未加入阵营"
+//     · userGroupPush  → 拿不到 group_id、走防御分支，观众点了选队按钮但永远不落座
+//   最坑的是两者仍返回 errcode:0 → 平台侧看着成功、发版检查也过，真机上却没人能选队。
+//   两种形状都吃下，彻底消掉这个静默失败。
+function pickBody(rawBody, fallback) {
+  try { const p = JSON.parse(rawBody || fallback || '{}'); return (Array.isArray(p) ? p[0] : p) || {}; }
+  catch (_) { return {}; }
+}
+
 // ③ 查询观众阵营数据（平台调·观众打开小摇杆时）：只查主动落座、不触发随机（没落座返回空串）。
 function queryUserGroup(rawBody, round) {
-  let body = {}; try { body = JSON.parse(rawBody || '{}'); } catch (_) {}
+  const body = pickBody(rawBody);
   const side = dy.chosenSide(body.open_id || '');
   return {
     errcode: 0, errmsg: 'success',
@@ -41,8 +53,8 @@ function queryUserGroup(rawBody, round) {
 // ④ 观众选择阵营（平台推·观众点选队按钮）：lockSide 落座（首次按选的方向锁定·已落座归原队不换）
 //    → 广播 join/c666 到游戏（首次=加入·永久推力+小火箭；已落座=加力）→ 返回实际加入阵营。
 function userGroupPush(rawBody, round, broadcast) {
-  let body = {}; try { body = JSON.parse(rawBody || '{}'); } catch (_) {}
-  const openId = body.open_id || '';
+  const body = pickBody(rawBody);
+  const openId = body.open_id || body.openid || body.sec_openid || '';
   const want = normGroup(body.group_id);
   // 防御：只处理带有效阵营(group_id)的「观众选择阵营」。无 group_id 的事件——
   // 如误配到本地址的「观众进出房数据」——直接 ack、不落座，避免观众一进房就被随机拉队/刷屏。
