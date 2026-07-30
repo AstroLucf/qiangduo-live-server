@@ -37,8 +37,12 @@ node server/index.js          # 或 cd server && npm start
 
 - [ ] **AppSecret**：控制台启用后用环境变量传，勿硬编：`DOUYIN_APPSECRET=xxx DEV_SKIP_SIGN=0 node server/index.js`
 - [ ] **验签算法**：`douyin.js > verifySign` 现为占位，用控制台「签名调试工具」校准定稿。
-- [ ] **礼物映射**：沙盒里置顶礼物后，把真实 `sec_gift_id` 回填 `douyin.js > GIFT_ID_TO_KEY`（比按价兜底可靠）。
-- [ ] **gift_value 单位**：用首条真实样例确认（抖币 / 分），校准价位兜底。
+- [x] ~~**礼物映射**~~：6 个付费礼物的真实 `sec_gift_id` 已全部回填 `douyin.js > GIFT_ID_TO_KEY`。
+      2026-07-30 抖音云日志验证：battery / mic / pill / donut 四种真机回调全部精确命中，
+      无一条 `[GIFT-UNMAPPED]` 告警。
+- [x] ~~**gift_value 单位**~~：2026-07-30 真机样例定案 —— **gift_value = 抖币 × 10**
+      （battery 99→990 / mic 299→2990 / pill 10→100 / donut 52→520）。真机带 sec_gift_id 走精确映射，
+      不碰按价兜底那张表；**切勿**让真机数值漏到 PRICE_TIERS，990 会被判成 airdrop（审核雷）。
 - [ ] **履约数据上报**：收到并处理后调抖音 ack 接口（去重 + 结算依据）。
 - [ ] **选队类型字符串**：确认官方 msg_type 后对齐 `/cb/team` 映射。
 - [ ] **access_token**：实现 2h 缓存刷新（启动任务/礼物置顶/履约 都要）。

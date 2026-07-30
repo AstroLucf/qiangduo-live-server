@@ -22,6 +22,13 @@ const GIFT_ID_TO_KEY = {
 };
 // 【兜底·仅无 sec_gift_id 时】按抖币价就近归档。用于自查/沙盒工具（送干净 gift_value、不带 sec_gift_id）。
 // ⚠ gift_value/diamond 的单位（抖币? 分?）在真机不可信 → 真机一律不走这条（见 giftToKey 分流）。
+// ★2026-07-30 真机样例已拿到（抖音云日志·test:true 的 live_gift 回调），单位问题就此定案：
+//     真机 gift_value = 抖币 × 10   —— battery 99→990 / mic 299→2990 / pill 10→100 / donut 52→520
+//   所以【绝对不能】把真机的 gift_value 拿来跟下面这张表比：990 会撞上 [520,'airdrop']，
+//   一个 99 抖币的电池被判成 520 抖币的空投 —— 正是"按不可信数值放大成大礼物"的审核雷。
+//   现在 giftToKey 的分流已经挡住了这条路（真机带 sec_gift_id → 精确映射；带了但没命中 → 保守落 wand），
+//   这张表只服务于"压根不带 sec_gift_id"的自查/沙盒场景，那里的 gift_value 是干净抖币值。
+//   ⚠ 改 giftToKey 的分流逻辑时务必重读这段：一旦让真机数据漏到这张表，就是审核事故。
 const PRICE_TIERS = [
   [520, 'airdrop'], [299, 'mic'], [99, 'battery'],
   [52, 'donut'], [10, 'pill'], [1, 'wand'],
