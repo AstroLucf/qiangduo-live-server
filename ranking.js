@@ -72,12 +72,16 @@ async function getToken(force) {
 async function call(path, body, _retried) {
   const token = await getToken();
   const r = await postJSON(API_HOST, API_PATH + path, body, { 'X-Token': token });
-  if (r && r.err_no === 40004 && !_retried) { await getToken(true); return call(path, body, true); }
-  // ★err_no 缺失 ≠ 出错（2026-07-30 修）：部分接口成功时压根不返回 err_no 字段，
-  //   旧写法 `undefined !== 0` 恒为真 → 每次成功都打一条 ⚠️ 假告警。
-  //   实测 world_rank/set_valid_version 就是这样：告警下一行紧跟着"世界榜生效版本 month_202607"（真成功了）。
-  //   联调期这种假告警最坑——它会把真正的错误淹掉，让人以为链路有问题。
-  if (r && r.err_no != null && r.err_no !== 0) log('⚠️', path, 'err_no=' + r.err_no, r.err_msg || '');
+  // ★★字段名修正（2026-07-30 · 线上实测）：gaming_con 系列返回的是 {errcode,errmsg}，
+  //   不是 {err_no,err_msg}。旧代码只读 err_no → 恒 undefined，造成两个后果：
+  //     ① 40004「access token is expired」的自动重刷【从未触发过】，token 一过期该模块就全线哑火；
+  //     ② 告警打成 "err_no=undefined"，看着像误报。
+  //   我今天一度把告警条件收紧成 `err_no != null`，等于把真错误一起吞了 —— 那次判断是错的，此处纠正。
+  //   现在两种字段名都兼容，err_no 优先（万一别的接口用这套）。
+  const code = r ? (r.err_no != null ? r.err_no : r.errcode) : undefined;
+  const emsg = r ? (r.err_msg || r.errmsg || '') : '';
+  if (code === 40004 && !_retried) { log('token 过期，强刷后重试', path); await getToken(true); return call(path, body, true); }
+  if (code != null && code !== 0) log('⚠️', path, 'err=' + code, emsg);
   return r;
 }
 
@@ -209,8 +213,15 @@ async function worldEnsureVersion() {
   if (!ENABLED) return;
   const v = worldVersion();
   if (v === _curVer) return;
-  try { await call('world_rank/set_valid_version', { app_id: APP_ID, is_online_version: IS_ONLINE, world_rank_version: v }); _curVer = v; log('世界榜生效版本', v); }
-  catch (e) { log('setValidVersion 失败', e.message); }
+  // ★只有真成功才认（2026-07-30 修）：旧写法不看返回值就 _curVer=v 并打「生效版本」，
+  //   接口报错也显示成功，且 _curVer 被记住 → 后续永不重试。我上次正是被这行误导 ——
+  //   看到「⚠️ 告警下一行紧跟着生效版本」就判定告警是误报，其实是告警对、这行在说谎。
+  try {
+    const r = await call('world_rank/set_valid_version', { app_id: APP_ID, is_online_version: IS_ONLINE, world_rank_version: v });
+    const code = r ? (r.err_no != null ? r.err_no : r.errcode) : undefined;
+    if (code != null && code !== 0) { log('世界榜生效版本【失败】', v, 'err=' + code); return; }
+    _curVer = v; log('世界榜生效版本', v);
+  } catch (e) { log('setValidVersion 失败', e.message); }
 }
 
 let _worldBusy = false;
