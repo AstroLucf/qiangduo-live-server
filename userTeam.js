@@ -73,14 +73,16 @@ function userGroupPush(rawBody, round, broadcast) {
   };
 }
 
-// 观众进出房数据（专门接口）：进场时若该观众在**世界榜前十** → 广播 {type:'rankEnter',rank} 到游戏，
-// 客户端播对应名次入场视频（横屏·上下黑边渐变·8 秒）。非前十/查不到名次 → 只 ack 不播。
+// 观众进出房数据（专门接口）：进场时若该观众在**世界榜前一百** → 广播 {type:'rankEnter',rank} 到游戏，
+// 客户端按名次分档播入场视频（1~5 各一条 / 6-10 / 11-20 / 21-30 / 31-50 / 51-100 共用·见 main.js RANK_ENTER_TIERS）。
+// 非前百/查不到名次 → 只 ack 不播。2026-07-31 由前十扩到前百（用户换了素材文件夹）。
 // 字段以真机为准（open_id、是否弹幕玩法老玩家、直播贡献梯度、发起召集用户 openid 等）。
 // TODO 后续：发起召集 openid → 触发召集效果；老玩家/高贡献 → 差异化欢迎横幅。
-const rankEnterCooldown = new Map();          // openid -> lastMs（同一前十观众 60s 内反复进场，只显示第一次动画）
+const RANK_ENTER_MAX = 100;                   // 触发上限：世界榜前 100 名进场才播（客户端 main.js 同名常量兜底同一个数）
+const rankEnterCooldown = new Map();          // openid -> lastMs（同一上榜观众 60s 内反复进场，只显示第一次动画）
 const RANK_ENTER_COOLDOWN_MS = 60000;         // 60s 去抖
-// 🔧 测试开关：env RANK_ENTER_TEST=<1-10> → 每个进场观众都强制当该名次触发入场视频（免真送礼凑榜、免 60s 去抖）。
-//    测完把这个环境变量删掉即恢复"真·世界榜前十才播"。0/未设 = 关闭。
+// 🔧 测试开关：env RANK_ENTER_TEST=<1-100> → 每个进场观众都强制当该名次触发入场视频（免真送礼凑榜、免 60s 去抖）。
+//    测完把这个环境变量删掉即恢复"真·世界榜前百才播"。0/未设 = 关闭。
 const RANK_ENTER_TEST = parseInt(process.env.RANK_ENTER_TEST || '0', 10);
 function audienceChange(rawBody, broadcast, worldRankOf) {
   // ⚠ 真机回调 raw 是数组 [{...}]（同 /cb/* 与礼物回调）→ 必须取 [0]！直接 body.open_id 会全取空、永不触发。
@@ -91,11 +93,11 @@ function audienceChange(rawBody, broadcast, worldRankOf) {
   const act = String(body.action || body.event || body.event_type || body.type || '').toLowerCase();
   const isEnter = !act || /enter|join|in\b|come/.test(act);
   if (openId && isEnter && typeof broadcast === 'function' && typeof worldRankOf === 'function') {
-    const testMode = RANK_ENTER_TEST >= 1 && RANK_ENTER_TEST <= 10;
+    const testMode = RANK_ENTER_TEST >= 1 && RANK_ENTER_TEST <= RANK_ENTER_MAX;
     const rank = testMode ? RANK_ENTER_TEST : worldRankOf(openId);   // 测试开关开 → 强制名次；否则真查世界榜
-    // 诊断：每个进场者的世界榜名次一眼可见（未上榜/非前十/触发 都打出来，方便排查为啥不播）
-    console.log(`[room→] 进场 openid=${String(openId).slice(0, 10)}… 名次=${rank || '未上榜(需先送礼累计)'}${testMode ? '(测试强制)' : ''} ${rank >= 1 && rank <= 10 ? '→ 触发榜' + rank + '入场视频' : '(非前十·不播)'}`);
-    if (rank >= 1 && rank <= 10) {
+    // 诊断：每个进场者的世界榜名次一眼可见（未上榜/非前百/触发 都打出来，方便排查为啥不播）
+    console.log(`[room→] 进场 openid=${String(openId).slice(0, 10)}… 名次=${rank || '未上榜(需先送礼累计)'}${testMode ? '(测试强制)' : ''} ${rank >= 1 && rank <= RANK_ENTER_MAX ? '→ 触发榜' + rank + '入场视频' : '(非前百·不播)'}`);
+    if (rank >= 1 && rank <= RANK_ENTER_MAX) {
       const now = Date.now();
       const last = rankEnterCooldown.get(openId) || 0;
       if (testMode || now - last > RANK_ENTER_COOLDOWN_MS) {   // 测试模式跳过去抖；正式态 60s 内同一人只第一次播
