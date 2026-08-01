@@ -225,7 +225,7 @@ const server = http.createServer(async (req, res) => {
       // ★入场视频触发（2026-08-01）：放在 recordGift【之后】——首次互动就是送礼的新观众，
       //   要先把这一单计进世界榜，他才有名次；放前面的话第一次送礼的人永远播不出来。
       //   身份取 evs[0]（translate 已做 7 嵌套×8 字段名容错），没翻译出事件则回退 dy.userOf。
-      ut.noteInteraction(evs[0] || dy.userOf(item), broadcast, rank.worldRankOf);
+      ut.noteInteraction(evs[0] || dy.userOf(item), broadcast, rank.worldRankOf, msgType === 'live_gift');
     }
     broadcast(events);
     // TODO(联调)：收到并处理成功后，调抖音「履约数据上报」做 ack（去重 + 结算依据）。
@@ -272,7 +272,7 @@ const server = http.createServer(async (req, res) => {
   }
   //   ④ 观众点选队按钮（平台推·x-msg-type: user_group_push）→ lockSide 落座 + 广播到游戏 → 返回实际阵营
   if (path === '/user_group_push' && req.method === 'POST') {
-    const out = ut.userGroupPush(await readBody(req), currentRound, broadcast);
+    const out = ut.userGroupPush(await readBody(req), currentRound, broadcast, rank.worldRankOf);
     console.log(`[team] 观众选队 → ${JSON.stringify(out.data)}`);
     return json(res, 200, out);
   }

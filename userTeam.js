@@ -52,7 +52,7 @@ function queryUserGroup(rawBody, round) {
 
 // ④ 观众选择阵营（平台推·观众点选队按钮）：lockSide 落座（首次按选的方向锁定·已落座归原队不换）
 //    → 广播 join/c666 到游戏（首次=加入·永久推力+小火箭；已落座=加力）→ 返回实际加入阵营。
-function userGroupPush(rawBody, round, broadcast) {
+function userGroupPush(rawBody, round, broadcast, worldRankOf) {
   const body = pickBody(rawBody);
   const openId = body.open_id || body.openid || body.sec_openid || '';
   const want = normGroup(body.group_id);
@@ -66,6 +66,9 @@ function userGroupPush(rawBody, round, broadcast) {
   if ((side === 'left' || side === 'right') && typeof broadcast === 'function') {
     const user = { openid: openId, nickname: body.nickname || '', avatar: body.avatar_url || '' };
     broadcast([{ side, key: first ? 'join' : 'c666', count: 1, ...user }]);
+    // ★入场视频的【第二条】触发路径：小摇杆点选队按钮 = 最明确的"落座"动作。
+    //   noteInteraction 与 /cb/* 共用 enteredThisRound，所以「先点按钮后送礼」不会重复播。
+    noteInteraction(user, broadcast, worldRankOf, false);
   }
   return {
     errcode: 0, errmsg: 'success',
@@ -112,34 +115,48 @@ function audienceChange(rawBody, broadcast, worldRankOf) {
 }
 
 // ============================================================
-//  首次互动触发入场视频（2026-08-01 加 · 替代平台「观众进出房」回调）
+//  落座即触发入场视频（2026-08-01 · 替代平台「观众进出房」回调）
 //  ------------------------------------------------------------
 //  🔴 为什么不用 audienceChange：实测平台【从不推送】观众进出房数据。
 //     能力已开通（基础能力页·开关已开）、抖音云回调路径已注册、开发配置已绑定 —— 三层全通，
 //     但抖音云日志检索近 7 天真实调用 = 0（唯一 1 条是自己打的部署探针）。
 //     同窗口 40 条 like/gift 事件全部正常到达 → 不是链路问题，是这个回调平台就是不发。
-//  ✅ 改用确证畅通的 /cb/{like,comment,gift} 作触发源：它们带 openid + nickname + avatar，
-//     信息量与进出房回调等价，且真机实测每条必达。
+//  ✅ 改挂在「落座」这一刻。本游戏里落座有【两条】路径，都确证会响，缺一不可：
+//       ① 小摇杆点选队按钮 → /api/user_group_push   （近 7 天 66 条·活跃）
+//       ② 任何首次互动     → /api/cb/{like,comment,gift}（同窗口 40 条·活跃）
+//     只接 ① 会漏掉不点按钮直接送礼的人；只接 ② 会漏掉点了按钮就安静看的人。
 //  语义 = 每局每人最多播一次（enteredThisRound 每局清），叠加 60s 跨局去抖做保险。
 // ============================================================
-const enteredThisRound = new Set();           // 本局已播过入场的 openid
-function resetRoundEnter() { enteredThisRound.clear(); }
+const enteredThisRound = new Set();           // 本局已【真的播过】入场的 openid
+const seenThisRound = new Set();              // 本局出现过的 openid（判首次 + 防日志刷屏）
+function resetRoundEnter() { enteredThisRound.clear(); seenThisRound.clear(); }
 
-function noteInteraction(user, broadcast, worldRankOf) {
+// isGift=true 表示本次互动是送礼（会改变世界榜名次）→ 需要重新查名次。
+function noteInteraction(user, broadcast, worldRankOf, isGift) {
   const openId = user && (user.openid || user.open_id || user.sec_openid);
   if (!openId || typeof broadcast !== 'function' || typeof worldRankOf !== 'function') return;
   if (enteredThisRound.has(openId)) return;   // 本局已播过 → 后续互动不再触发
-  enteredThisRound.add(openId);
+  const first = !seenThisRound.has(openId);
+  seenThisRound.add(openId);
+  // ★只在【本局首次出现】或【本次是送礼】时才查名次：worldRankOf 每次都要把整张世界榜排序，
+  //   挂在每一条点赞上纯属浪费；而名次只可能因送礼变化。
+  if (!first && !isGift) return;
   const testMode = RANK_ENTER_TEST >= 1 && RANK_ENTER_TEST <= RANK_ENTER_MAX;
   const rank = testMode ? RANK_ENTER_TEST : worldRankOf(openId);
   const now = Date.now();
   const cooling = !testMode && now - (rankEnterCooldown.get(openId) || 0) <= RANK_ENTER_COOLDOWN_MS;
+  const ok = rank >= 1 && rank <= RANK_ENTER_MAX && !cooling;
   // ★先把结论算出来再打日志：别写成「打完『→ 触发』再 return」——那样日志会谎报触发（2026-08-01 自测抓到）。
-  const verdict = !(rank >= 1 && rank <= RANK_ENTER_MAX) ? '(非前百·不播)'
+  const verdict = !(rank >= 1 && rank <= RANK_ENTER_MAX) ? '(未上榜·不播·送礼后会再查)'
                 : cooling ? `(榜${rank}·但 ${Math.round(RANK_ENTER_COOLDOWN_MS / 1000)}s 内已播过·跳过)`
                 : `→ 触发榜${rank}入场视频`;
-  console.log(`[enter] 首次互动 openid=${String(openId).slice(0, 10)}… 名次=${rank || '未上榜(世界榜=送礼累计·本实例重启后清零)'}${testMode ? '(测试强制)' : ''} ${verdict}`);
-  if (!(rank >= 1 && rank <= RANK_ENTER_MAX) || cooling) return;
+  if (first || ok || cooling) {   // 无名次的后续送礼不再刷屏，只在首次/有结果时打
+    console.log(`[enter] 落座 openid=${String(openId).slice(0, 10)}… 名次=${rank || '未上榜(世界榜=送礼累计·本实例重启后清零)'}${testMode ? '(测试强制)' : ''} ${verdict}`);
+  }
+  if (!ok) return;
+  // ★★记账放在【确认要播之后】：早期版本无条件 add，导致「先点赞(无名次)后送礼(有名次了)」的人
+  //   在点赞那一下就被记死、这一局永远播不出来 —— 而这恰恰是最常见的真实路径。
+  enteredThisRound.add(openId);
   rankEnterCooldown.set(openId, now);
   broadcast([{ type: 'rankEnter', rank, openid: openId, nickname: user.nickname || '', avatar: user.avatar || user.avatar_url || '' }]);
 }
