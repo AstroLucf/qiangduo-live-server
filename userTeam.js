@@ -111,4 +111,37 @@ function audienceChange(rawBody, broadcast, worldRankOf) {
   return { errcode: 0, errmsg: 'success', data: {} };
 }
 
-module.exports = { queryUserGroup, userGroupPush, audienceChange, normGroup };
+// ============================================================
+//  首次互动触发入场视频（2026-08-01 加 · 替代平台「观众进出房」回调）
+//  ------------------------------------------------------------
+//  🔴 为什么不用 audienceChange：实测平台【从不推送】观众进出房数据。
+//     能力已开通（基础能力页·开关已开）、抖音云回调路径已注册、开发配置已绑定 —— 三层全通，
+//     但抖音云日志检索近 7 天真实调用 = 0（唯一 1 条是自己打的部署探针）。
+//     同窗口 40 条 like/gift 事件全部正常到达 → 不是链路问题，是这个回调平台就是不发。
+//  ✅ 改用确证畅通的 /cb/{like,comment,gift} 作触发源：它们带 openid + nickname + avatar，
+//     信息量与进出房回调等价，且真机实测每条必达。
+//  语义 = 每局每人最多播一次（enteredThisRound 每局清），叠加 60s 跨局去抖做保险。
+// ============================================================
+const enteredThisRound = new Set();           // 本局已播过入场的 openid
+function resetRoundEnter() { enteredThisRound.clear(); }
+
+function noteInteraction(user, broadcast, worldRankOf) {
+  const openId = user && (user.openid || user.open_id || user.sec_openid);
+  if (!openId || typeof broadcast !== 'function' || typeof worldRankOf !== 'function') return;
+  if (enteredThisRound.has(openId)) return;   // 本局已播过 → 后续互动不再触发
+  enteredThisRound.add(openId);
+  const testMode = RANK_ENTER_TEST >= 1 && RANK_ENTER_TEST <= RANK_ENTER_MAX;
+  const rank = testMode ? RANK_ENTER_TEST : worldRankOf(openId);
+  const now = Date.now();
+  const cooling = !testMode && now - (rankEnterCooldown.get(openId) || 0) <= RANK_ENTER_COOLDOWN_MS;
+  // ★先把结论算出来再打日志：别写成「打完『→ 触发』再 return」——那样日志会谎报触发（2026-08-01 自测抓到）。
+  const verdict = !(rank >= 1 && rank <= RANK_ENTER_MAX) ? '(非前百·不播)'
+                : cooling ? `(榜${rank}·但 ${Math.round(RANK_ENTER_COOLDOWN_MS / 1000)}s 内已播过·跳过)`
+                : `→ 触发榜${rank}入场视频`;
+  console.log(`[enter] 首次互动 openid=${String(openId).slice(0, 10)}… 名次=${rank || '未上榜(世界榜=送礼累计·本实例重启后清零)'}${testMode ? '(测试强制)' : ''} ${verdict}`);
+  if (!(rank >= 1 && rank <= RANK_ENTER_MAX) || cooling) return;
+  rankEnterCooldown.set(openId, now);
+  broadcast([{ type: 'rankEnter', rank, openid: openId, nickname: user.nickname || '', avatar: user.avatar || user.avatar_url || '' }]);
+}
+
+module.exports = { queryUserGroup, userGroupPush, audienceChange, normGroup, noteInteraction, resetRoundEnter };

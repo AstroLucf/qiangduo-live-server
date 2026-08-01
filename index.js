@@ -222,6 +222,10 @@ const server = http.createServer(async (req, res) => {
         recentRawGifts.push({ sec_gift_id: item.sec_gift_id || '', gift_value: item.gift_value ?? item.diamond ?? null, key: evs[0] ? evs[0].key : '(丢弃)', nick: (evs[0] && evs[0].nickname) || dy.userOf(item).nickname || '' });
         if (recentRawGifts.length > 30) recentRawGifts.shift();
       }
+      // ★入场视频触发（2026-08-01）：放在 recordGift【之后】——首次互动就是送礼的新观众，
+      //   要先把这一单计进世界榜，他才有名次；放前面的话第一次送礼的人永远播不出来。
+      //   身份取 evs[0]（translate 已做 7 嵌套×8 字段名容错），没翻译出事件则回退 dy.userOf。
+      ut.noteInteraction(evs[0] || dy.userOf(item), broadcast, rank.worldRankOf);
     }
     broadcast(events);
     // TODO(联调)：收到并处理成功后，调抖音「履约数据上报」做 ack（去重 + 结算依据）。
@@ -233,7 +237,7 @@ const server = http.createServer(async (req, res) => {
   if ((path === '/round/start' || path === '/round/end') && req.method === 'POST') {
     let body = {}; try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
     const roomId = body.room_id || lastRoomId;
-    if (path === '/round/start') { dy.clearSides(); rank.startRound(roomId, dyc.getAnchorOpenId()); currentRound = { id: currentRound.id + 1, status: 1 }; return json(res, 200, { ok: true, roomId, roundId: currentRound.id }); }
+    if (path === '/round/start') { dy.clearSides(); ut.resetRoundEnter(); rank.startRound(roomId, dyc.getAnchorOpenId()); currentRound = { id: currentRound.id + 1, status: 1 }; return json(res, 200, { ok: true, roomId, roundId: currentRound.id }); }
     const winner = body.winner === 'left' || body.winner === 'right' ? body.winner : 'tie';
     rank.endRound(roomId, winner);
     currentRound.status = 2;
