@@ -282,6 +282,25 @@ const server = http.createServer(async (req, res) => {
     console.log(`[room] 观众进出房 ${(raw || '').slice(0, 160)}`);
     return json(res, 200, ut.audienceChange(raw, broadcast, rank.worldRankOf));
   }
+  // 运维：看/清 世界榜内存（world 是进程内存，联调假号会占榜前排把真实观众挤下去）。
+  //   GET  /api/world            → 看前 N 名（?limit=20）
+  //   POST /api/world/reset      → 清；body {prefix:"_000E2E"} 定点清，不传 prefix = 全清
+  //   ★鉴权：body.token 或头 x-admin-token 必须等于 APPSECRET；没配 APPSECRET 则整个端点关闭。
+  //     别做成裸开——它能抹掉线上榜单数据。
+  if (path === '/world' && req.method === 'GET') {
+    return json(res, 200, { ok: true, list: rank.worldPeek(u.searchParams.get('limit')) });
+  }
+  if (path === '/world/reset' && req.method === 'POST') {
+    let body = {}; try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
+    const tok = req.headers['x-admin-token'] || body.token || '';
+    if (!cfg.APPSECRET || tok !== cfg.APPSECRET) {
+      console.warn('[world] 清榜被拒（token 不符或未配 APPSECRET）');
+      return json(res, 403, { ok: false, err: 'forbidden' });
+    }
+    const r = rank.resetWorld(body.prefix || '');
+    console.log(`[world] 清榜 prefix=${body.prefix || '(全清)'} removed=${r.removed} left=${r.left}`);
+    return json(res, 200, { ok: true, ...r });
+  }
   // 诊断(临时):手动打选队三 API 看真实 err_no。GET /api/selftest_team?anchor=<主播openid>
   if (path === '/selftest_team') {
     return json(res, 200, { ok: true, test: await rank.selfTestTeam(u.searchParams.get('room') || '1100000000000000888', u.searchParams.get('anchor') || '') });

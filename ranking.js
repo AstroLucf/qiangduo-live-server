@@ -251,10 +251,34 @@ function startWorldCron(ms) {
 }
 function stopWorldCron() { if (_cron) { clearInterval(_cron); _cron = null; } }
 
+// 运维：清世界榜内存。prefix 非空 → 只删 openId 以它开头的（定点清联调假号，保住真实累计）；
+// 空 → 全清。返回 {removed, left, samples}。
+// ★为什么需要它（2026-08-01）：world 是进程内存，联调时打的测试假号会一直占着榜前排，
+//   真实观众名次被挤到后面、入场视频档位就不对。以前只能靠「重新部署一次」冲掉——
+//   而部署要登控制台，登录态一掉就卡死。有了这条，一行 curl 定点清，不惊动线上。
+function resetWorld(prefix) {
+  const before = world.size;
+  const samples = [];
+  if (prefix) {
+    for (const k of [...world.keys()]) if (k.startsWith(prefix)) { world.delete(k); if (samples.length < 10) samples.push(k); }
+  } else {
+    for (const k of [...world.keys()]) if (samples.length < 10) samples.push(k);
+    world.clear();
+  }
+  return { removed: before - world.size, left: world.size, samples };
+}
+
+// 只读：看世界榜当前都有谁（排查"名次为什么是这个"用）。limit 默认 20。
+function worldPeek(limit) {
+  return rankList(world).slice(0, Math.max(1, Math.min(+limit || 20, 150)))
+    .map((u) => ({ open_id: u.openId, rank: u.rank, score: u.score }));
+}
+
 module.exports = {
   enabled: ENABLED,
   recordGift, startRound, endRound, uploadUserGroup, selfTestTeam,
   worldEnsureVersion, worldTick, startWorldCron, stopWorldCron, worldRankOf,
+  resetWorld, worldPeek,
   _state: { rounds, world },     // 自测用
 };
 
