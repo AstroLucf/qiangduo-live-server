@@ -23,6 +23,7 @@
 'use strict';
 const https = require('https');
 const cfg = require('./config');
+const kv = require('./kv');        // 世界榜持久化（抖音云 Redis·没配环境变量则整体 no-op）
 
 // ---- 配置（APPID/APPSECRET 来自 config；其余读环境变量）----
 const APP_ID = cfg.APPID;                                   // tt62e91454fc8d46c610
@@ -91,6 +92,51 @@ async function call(path, body, _retried) {
 const rounds = new Map();
 const world = new Map();
 
+// ============================================================
+//  世界榜持久化（2026-08-01 加）
+//  ------------------------------------------------------------
+//  world 原本是纯进程内存 → 实例每重启/每部署一次，全部观众的累计战绩清零。
+//  而入场视频档位、小摇杆世界榜名次全靠它，上线后一天部署两次就等于清两次。
+//  ★只持久化 world，不持久化 rounds：一局是短命的，endRound 上报完就该丢；
+//    真在局中挂了那一局的明细丢掉可接受，而 world 是跨场累计、丢了没法重建。
+//  ★写入用【脏集合 + 定时批量 HSET】而不是每次送礼都写：礼物风暴时一秒几十次，
+//    逐次写纯属浪费；攒 2s 一次批量写，丢的最多是最后 2 秒（下一局照样能累计回来）。
+//  ★key 带世界榜版本(月) → 跨月自然换新表，与上报给平台的 world_rank_version 口径一致。
+// ============================================================
+const worldKey = () => 'qd:world:' + worldVersion();
+let _dirty = new Set(), _flushT = null, _hydrated = false;
+
+function markDirty(openId) {
+  if (!kv.enabled) return;
+  _dirty.add(openId);
+  if (_flushT) return;
+  _flushT = setTimeout(() => { _flushT = null; flushWorld().catch(() => {}); }, 2000);
+  if (_flushT.unref) _flushT.unref();
+}
+async function flushWorld() {
+  if (!kv.enabled || !_dirty.size) return;
+  const ids = [..._dirty]; _dirty.clear();
+  const pairs = [];
+  for (const id of ids) { const w = world.get(id); if (w) pairs.push(id, JSON.stringify(w)); }
+  // 已被 resetWorld 删掉的（world 里没有了）→ 从 Redis 也删掉，别让它复活
+  const gone = ids.filter((id) => !world.has(id));
+  if (pairs.length) await kv.hset(worldKey(), pairs);
+  if (gone.length) await kv.hdel(worldKey(), gone);
+}
+// 启动时把上次的累计读回来。读失败/未启用 → world 保持空，行为同改动前。
+async function hydrateWorld() {
+  if (!kv.enabled || _hydrated) return;
+  const o = await kv.hgetall(worldKey());
+  if (!o) { log('世界榜持久化未就绪(Redis 未连上)，本次以空表启动'); return; }
+  let n = 0;
+  for (const [id, s] of Object.entries(o)) {
+    try { const w = JSON.parse(s); if (w && typeof w.score === 'number') { world.set(id, w); n++; } } catch (_) {}
+  }
+  _hydrated = true;
+  log('世界榜已从持久化恢复', n, '人 · key=' + worldKey());
+}
+if (kv.enabled) setTimeout(() => hydrateWorld().catch((e) => log('恢复失败', e.message)), 800).unref();
+
 function recordGift({ openId, side, value, roomId }) {
   if (!ENABLED || !openId) return;
   const v = Math.max(0, Number(value) || 0);
@@ -100,6 +146,7 @@ function recordGift({ openId, side, value, roomId }) {
   // 世界累计
   const w = world.get(openId) || { score: 0, streak: 0, lastWin: false };
   w.score += v; world.set(openId, w);
+  markDirty(openId);
 }
 
 // 排序取榜：[{openId, score, side}] desc，附 rank（>1000 封顶）
@@ -200,7 +247,9 @@ async function endRound(roomId, winnerSide) {
     const w = world.get(u.openId); if (!w) continue;
     const win = winnerSide !== 'tie' && u.side === winnerSide;
     w.streak = win ? (w.streak || 0) + 1 : 0; w.lastWin = win;
+    markDirty(u.openId);
   }
+  flushWorld().catch(() => {});     // 局末立刻落一次，别等 2s 定时器（这会儿最容易被部署打断）
   rounds.delete(roomId);
   worldTick().catch(() => {});                     // 对局结束顺手刷一次世界榜
 }
@@ -259,13 +308,20 @@ function stopWorldCron() { if (_cron) { clearInterval(_cron); _cron = null; } }
 function resetWorld(prefix) {
   const before = world.size;
   const samples = [];
+  const killed = [];
   if (prefix) {
-    for (const k of [...world.keys()]) if (k.startsWith(prefix)) { world.delete(k); if (samples.length < 10) samples.push(k); }
+    for (const k of [...world.keys()]) if (k.startsWith(prefix)) { world.delete(k); killed.push(k); if (samples.length < 10) samples.push(k); }
   } else {
-    for (const k of [...world.keys()]) if (samples.length < 10) samples.push(k);
+    for (const k of [...world.keys()]) { killed.push(k); if (samples.length < 10) samples.push(k); }
     world.clear();
   }
-  return { removed: before - world.size, left: world.size, samples };
+  // ★同步删持久化，否则下次重启又被 hydrate 回来（清了个寂寞）
+  if (kv.enabled) {
+    if (prefix) kv.hdel(worldKey(), killed).catch(() => {});
+    else kv.del(worldKey()).catch(() => {});
+    killed.forEach((k) => _dirty.delete(k));
+  }
+  return { removed: before - world.size, left: world.size, samples, persisted: kv.enabled };
 }
 
 // 只读：看世界榜当前都有谁（排查"名次为什么是这个"用）。limit 默认 20。
