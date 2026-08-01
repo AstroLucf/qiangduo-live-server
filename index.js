@@ -14,6 +14,7 @@ const cfg = require('./config');
 const dy = require('./douyin');
 const rank = require('./ranking');
 const dyc = require('./douyincloud');     // 抖音云生产接入层（真机：内网回调 + WS 网关下行）
+const kv = require('./kv');               // 世界榜持久化（诊断用，/health 里回显状态）
 const ut = require('./userTeam');         // 「用户快捷选队」开发者侧接口（小摇杆点选阵营）
 
 // ── 实例指纹：FaaS 会把服务复制成多个实例分摊流量。每个实例进程启动时生成唯一 ID。
@@ -134,7 +135,8 @@ const server = http.createServer(async (req, res) => {
     // giftMap：部署校验用——重新部署后 curl /api/health，giftMap.battery=true 且 keys=6 = 新代码已上线（电池已精确映射）。
     const gm = dy.GIFT_ID_TO_KEY || {};
     const giftMap = { rev: '2026-07-02-battery-fixed', keys: Object.keys(gm).length, battery: Object.values(gm).includes('battery') };
-    return json(res, 200, { ok: true, instance: INSTANCE_ID, bootAt: BOOT_AT, clients: clients.size, sseSeen, appid: cfg.APPID, skipSign: cfg.DEV_SKIP_SIGN, defaultSide: cfg.DEFAULT_SIDE, giftMap });
+    // kv：世界榜持久化是否真的接上了（开通 Redis 后一眼确认，不用翻日志）
+    return json(res, 200, { ok: true, instance: INSTANCE_ID, bootAt: BOOT_AT, clients: clients.size, sseSeen, appid: cfg.APPID, skipSign: cfg.DEV_SKIP_SIGN, defaultSide: cfg.DEFAULT_SIDE, giftMap, kv: kv.diag() });
   }
 
   // 诊断：最近广播的事件（自查工具/真机推送后，看服务端翻译+广播了什么——即使没有游戏连着也能看）。
