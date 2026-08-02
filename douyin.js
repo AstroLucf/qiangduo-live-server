@@ -136,7 +136,7 @@ function commentText(payload) {
 
 // —— 评论意图 ——
 //  · 「1/大壮」「2/小美」严格命中 → 'left'/'right'：定向落座(可切队)
-//  · 含「666」→ 'cheer'：加油(随机落座加力)
+//  · 含「666」或【纯 6 串】(6/66/6666…) → 'cheer'：加油(效果同点赞,见 main.js 的 GIFT_ALIAS)
 //  · 其余评论(闲聊)→ null：不落座、不下发
 // 选队词用【严格相等】匹配(数组 includes，不是 s.includes)，避免「怎么跑到左去了」这类含字误判落座。
 const LEFT_WORDS = ['1', '大壮', '帮大壮', '左'];
@@ -146,7 +146,9 @@ function commentIntent(content) {
   if (!s) return null;
   if (LEFT_WORDS.includes(s)) return 'left';
   if (RIGHT_WORDS.includes(s)) return 'right';
-  if (s.includes('666')) return 'cheer';
+  // 「666」子串 已覆盖 666/6666…/牛666啊；再补【纯 6 串】收掉直播间同样高频的「6」「66」。
+  // ⚠ 必须放在 LEFT/RIGHT 之后：那两组是严格相等匹配，'1'/'2' 不会被这条抢走。
+  if (s.includes('666') || /^6+$/.test(s)) return 'cheer';
   return null;
 }
 
