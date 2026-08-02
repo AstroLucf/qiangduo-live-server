@@ -134,7 +134,14 @@ const server = http.createServer(async (req, res) => {
   if (path === '/health') {
     // giftMap：部署校验用——重新部署后 curl /api/health，giftMap.battery=true 且 keys=6 = 新代码已上线（电池已精确映射）。
     const gm = dy.GIFT_ID_TO_KEY || {};
-    const giftMap = { rev: '2026-07-02-battery-fixed', keys: Object.keys(gm).length, battery: Object.values(gm).includes('battery') };
+    // 把全表的 key 都列出来（原先只回 keys 数量 + battery 布尔，看不出少了哪一个）。
+    // 6 个礼物一眼点名：wand/pill/donut/battery/mic/airdrop 谁 false 就是线上跑的表缺谁。
+    const has = (k) => Object.values(gm).includes(k);
+    const giftMap = {
+      rev: '2026-08-02-giftmap-full', keys: Object.keys(gm).length,
+      wand: has('wand'), pill: has('pill'), donut: has('donut'),
+      battery: has('battery'), mic: has('mic'), airdrop: has('airdrop'),
+    };
     // kv：世界榜持久化是否真的接上了（开通 Redis 后一眼确认，不用翻日志）
     return json(res, 200, { ok: true, instance: INSTANCE_ID, bootAt: BOOT_AT, clients: clients.size, sseSeen, appid: cfg.APPID, skipSign: cfg.DEV_SKIP_SIGN, defaultSide: cfg.DEFAULT_SIDE, giftMap, kv: kv.diag() });
   }
@@ -153,9 +160,21 @@ const server = http.createServer(async (req, res) => {
   if (path === '/rawgifts') {
     return json(res, 200, {
       ok: true, instance: INSTANCE_ID,
-      hint: '找 key 与礼物不符的那条（如送电池却 key=airdrop），复制其 sec_gift_id 回填 douyin.js GIFT_ID_TO_KEY',
+      hint: '先看 mapped：false = 未登记礼物(已兜底成无效果的 wand)，复制 sec_gift_id 回填 douyin.js GIFT_ID_TO_KEY；' +
+            '整条都找不到 = 平台没推该礼物 → 查 /api/failgifts，仍为空则是「玩法礼物配置没随包体过审」',
       gifts: recentRawGifts.slice(-30),
     });
+  }
+
+  // 诊断：拉抖音「推送失败数据」做补偿/定责。GET /api/failgifts?room=<roomid>&page=1&type=live_gift
+  //   · 有数据 → 平台推过但没送达我们（网络/我方 5xx），payload 可直接补跑；
+  //   · 空 且 /rawgifts 也没有该礼物 → 平台压根没推 = 该礼物不在当前生效的玩法礼物配置里。
+  //   room 不传则用最近一次回调的 room_id。本地跑必然 reachable 失败（内网 host 只在抖音云解析）。
+  if (path === '/failgifts') {
+    const room = u.searchParams.get('room') || lastRoomId;
+    const r = await dyc.failData(room, u.searchParams.get('type') || 'live_gift',
+      parseInt(u.searchParams.get('page') || '1', 10), parseInt(u.searchParams.get('size') || '100', 10));
+    return json(res, 200, { ok: true, room, resp: r });
   }
 
   // SSE：客户端订阅下行数值
@@ -221,7 +240,20 @@ const server = http.createServer(async (req, res) => {
         const openId = dy.userOf(item).openid;
         rank.recordGift({ openId, side: dy.sideOf(openId, cfg.DEFAULT_SIDE), value: item.gift_value || item.diamond, roomId: roomId || lastRoomId });
         // 诊断：记原始礼物身份 → /rawgifts 一键读 sec_gift_id 回填映射表（尤其审核抓的漏配礼物）
-        recentRawGifts.push({ sec_gift_id: item.sec_gift_id || '', gift_value: item.gift_value ?? item.diamond ?? null, key: evs[0] ? evs[0].key : '(丢弃)', nick: (evs[0] && evs[0].nickname) || dy.userOf(item).nickname || '' });
+        // ★mapped 必看：false = 这个 sec_gift_id 不在 GIFT_ID_TO_KEY 里，giftToKey 兜底成了 wand。
+        //   而仙女棒自 2026-07-29 起是【纯升级道具】——没推力、没特效 —— 于是"未登记礼物"的表现
+        //   就是【观众花了钱、游戏毫无反应】，与"平台压根没推"肉眼无法区分。这个标记就是用来区分的。
+        recentRawGifts.push({
+          at: new Date().toISOString().slice(11, 19),
+          sec_gift_id: item.sec_gift_id || '',
+          gift_value: item.gift_value ?? item.diamond ?? null,
+          // ★key 必须直接由 sec_gift_id 反查，不能取 evs[0].key ——
+          //   首次互动的观众，translate 会在礼物事件【前面】插一条 join，evs[0] 恒为 'join'，
+          //   于是"新观众送的话筒"在这里显示成 join，看起来像话筒没到，实际是记错了。
+          key: evs.length ? dy.giftToKey({ sec_gift_id: item.sec_gift_id, diamond: item.gift_value || item.diamond }) : '(丢弃)',
+          mapped: !!(item.sec_gift_id && (dy.GIFT_ID_TO_KEY || {})[item.sec_gift_id]),
+          nick: (evs[0] && evs[0].nickname) || dy.userOf(item).nickname || '',
+        });
         if (recentRawGifts.length > 30) recentRawGifts.shift();
       }
       // ★入场视频触发（2026-08-01）：放在 recordGift【之后】——首次互动就是送礼的新观众，

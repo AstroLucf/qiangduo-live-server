@@ -45,6 +45,31 @@ function postInternal(host, path, body, headers) {
   });
 }
 
+// 内网 HTTP GET（同 postInternal：仅在抖音云内网可解析，免 access_token）
+function getInternal(host, path, headers) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host, path, method: 'GET', headers: { 'Content-Type': 'application/json', ...headers } },
+      (res) => { let b = ''; res.on('data', (c) => (b += c)); res.on('end', () => { try { resolve(JSON.parse(b || '{}')); } catch (_) { resolve({ raw: b }); } }); });
+    req.on('error', reject); req.setTimeout(8000, () => req.destroy(new Error('timeout')));
+    req.end();
+  });
+}
+
+// ── 补偿查询：分页拉「推送失败」的礼物/粉丝团数据 ──
+// 官方 https://webcast.bytedance.com/api/live_data/task/fail_data/get（GET·需 access-token），
+// 内网走同 path 免 token。返回空 = 全部推送成功；非空 = 平台推过但没送达我们。
+// ★用途：观众送了礼物、服务端 /rawgifts 里却找不到那一条时，用它区分两种根因——
+//     这里有 → 平台推了但没到（网络/我们 5xx），照 payload 补跑即可；
+//     这里也没有 → 平台【压根没推】＝ 该礼物不在「当前生效的玩法礼物配置」里（配置随包体版本绑定）。
+// 注意：补偿数据没有 ack 机制，页码要自己维护；单 app_id 限 10 次/秒。
+async function failData(roomId, msgType, pageNum, pageSize) {
+  const q = `appid=${encodeURIComponent(APP_ID)}&msg_type=${encodeURIComponent(msgType || 'live_gift')}` +
+            `&page_num=${pageNum || 1}&page_size=${Math.min(pageSize || 100, 100)}&roomid=${encodeURIComponent(roomId || '')}`;
+  try {
+    return await getInternal(OPENAPI_HOST, '/api/live_data/task/fail_data/get?' + q);
+  } catch (e) { return { err_no: -1, err_msg: e.message, hint: '内网 host 不可达 → 本地跑必然如此，须在抖音云上访问' }; }
+}
+
 // ── 下行：把一条玩法指令经 WS 网关推给主播客户端 ──
 async function pushToClient(anchorOpenId, msgId, msgType, dataStr) {
   if (!anchorOpenId) return;
@@ -200,4 +225,4 @@ async function selfCheck(token, envId, serviceId) {
   return out;
 }
 
-module.exports = { startGame, liveDataCallback, websocketCallback, finishGame, pushToClient, startTasks, getConnId, getLiveInfo, selfCheck, getAnchorOpenId: () => lastAnchorOpenId };
+module.exports = { startGame, liveDataCallback, websocketCallback, finishGame, pushToClient, startTasks, getConnId, getLiveInfo, selfCheck, failData, getAnchorOpenId: () => lastAnchorOpenId };
