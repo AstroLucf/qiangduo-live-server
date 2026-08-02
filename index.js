@@ -16,6 +16,8 @@ const rank = require('./ranking');
 const dyc = require('./douyincloud');     // 抖音云生产接入层（真机：内网回调 + WS 网关下行）
 const kv = require('./kv');               // 世界榜持久化（诊断用，/health 里回显状态）
 const ut = require('./userTeam');         // 「用户快捷选队」开发者侧接口（小摇杆点选阵营）
+const pool = require('./pool');           // 积分池底池存档（按主播 openid 持久化到 Redis）
+const ledger = require('./ledger');       // 观众积分账本（服务端真源：计分/结算/周月榜/连胜）
 
 // ── 实例指纹：FaaS 会把服务复制成多个实例分摊流量。每个实例进程启动时生成唯一 ID。
 //    连续刷 /health 若看到多个不同 instance → 多实例（这正是 SSE 0 端的根：连接与回调落不同实例）。
@@ -102,7 +104,22 @@ function broadcast(events) {
   recentEvents.push({ seq, frame });
   if (recentEvents.length > REPLAY_MAX) recentEvents.shift();        // 环形：超容量丢最老
   for (const res of clients) { try { res.write(frame); } catch (_) {} }
-  console.log(`[push] #${seq} ${events.map((e) => `${e.side}:${e.key}×${e.count}`).join('  ')}  → ${clients.size} 端`);
+  console.log(`[push] #${seq} ${events.map((e) => (e.type ? `${e.type}(${e.users ? e.users.length + '人·池' + e.pool : ''})` : `${e.side}:${e.key}×${e.count}`)).join('  ')}  → ${clients.size} 端`);
+}
+
+// ── 账本快照下行 ──
+// 走的是同一条 SSE，不另开通道：礼物事件已经在这条线上，快照跟着走天然同步、零额外延迟。
+// 节流 1.5s：礼物风暴时一秒几十条互动，每条都推整本账等于自己 DDoS 自己；
+// 而积分池/榜单本来就是"看个大概"的显示，1.5s 完全够。开局/结算/结转 走 now=true 立刻推。
+const LEDGER_PUSH_MS = 1500;
+let _ledgerT = null, _ledgerPending = false;
+function pushLedger(now) {
+  if (!clients.size) return;                     // 没人连着就别算快照（snapshot 要排序整表）
+  if (now) { clearTimeout(_ledgerT); _ledgerT = null; _ledgerPending = false; return broadcast([ledger.snapshot()]); }
+  if (_ledgerT) { _ledgerPending = true; return; }
+  broadcast([ledger.snapshot()]);
+  _ledgerT = setTimeout(() => { _ledgerT = null; if (_ledgerPending) { _ledgerPending = false; pushLedger(); } }, LEDGER_PUSH_MS);
+  if (_ledgerT.unref) _ledgerT.unref();
 }
 
 function cors(res) {
@@ -143,7 +160,7 @@ const server = http.createServer(async (req, res) => {
       battery: has('battery'), mic: has('mic'), airdrop: has('airdrop'),
     };
     // kv：世界榜持久化是否真的接上了（开通 Redis 后一眼确认，不用翻日志）
-    return json(res, 200, { ok: true, instance: INSTANCE_ID, bootAt: BOOT_AT, clients: clients.size, sseSeen, appid: cfg.APPID, skipSign: cfg.DEV_SKIP_SIGN, defaultSide: cfg.DEFAULT_SIDE, giftMap, kv: kv.diag() });
+    return json(res, 200, { ok: true, instance: INSTANCE_ID, bootAt: BOOT_AT, clients: clients.size, sseSeen, appid: cfg.APPID, skipSign: cfg.DEV_SKIP_SIGN, defaultSide: cfg.DEFAULT_SIDE, giftMap, kv: kv.diag(), pool: pool.diag(), ledger: ledger.diag() });
   }
 
   // 诊断：最近广播的事件（自查工具/真机推送后，看服务端翻译+广播了什么——即使没有游戏连着也能看）。
@@ -235,10 +252,12 @@ const server = http.createServer(async (req, res) => {
       if (evs[0]) console.log(`[cb→] side=${evs[0].side} key=${evs[0].key} openid=${evs[0].openid || '(空!)'} avatar=${evs[0].avatar ? '有' : '(空!)'} nick=${evs[0].nickname || '(空)'}`);
       else console.log(`[cb→] ${msgType} → 0 事件（未选队 / 字段取空被丢弃）`);
       events = events.concat(evs);
-      // 战绩累计：礼物驱动每用户分
+      // ★玩法积分入账（服务端真源）：按 gifts.js 的 pts 记，与客户端 GIFTS.pts 同口径。
+      //   逐条 translate 结果记一次 —— 连击的 count 不重复计分，与客户端 `scoring: i===0` 对齐。
+      //   ⚠ 必须在 noteInteraction【之前】：入场视频要按名次分档，而名次现在由账本算，
+      //     先记账他才有名次。旧代码这条顺序是靠 recordGift 保证的，换真源后同样要守住。
+      for (const ev of evs) ledger.record(ev);
       if (msgType === 'live_gift') {
-        const openId = dy.userOf(item).openid;
-        rank.recordGift({ openId, side: dy.sideOf(openId, cfg.DEFAULT_SIDE), value: item.gift_value || item.diamond, roomId: roomId || lastRoomId });
         // 诊断：记原始礼物身份 → /rawgifts 一键读 sec_gift_id 回填映射表（尤其审核抓的漏配礼物）
         // ★mapped 必看：false = 这个 sec_gift_id 不在 GIFT_ID_TO_KEY 里，giftToKey 兜底成了 wand。
         //   而仙女棒自 2026-07-29 起是【纯升级道具】——没推力、没特效 —— 于是"未登记礼物"的表现
@@ -256,12 +275,13 @@ const server = http.createServer(async (req, res) => {
         });
         if (recentRawGifts.length > 30) recentRawGifts.shift();
       }
-      // ★入场视频触发（2026-08-01）：放在 recordGift【之后】——首次互动就是送礼的新观众，
-      //   要先把这一单计进世界榜，他才有名次；放前面的话第一次送礼的人永远播不出来。
+      // ★入场视频触发（2026-08-01）：放在【记账之后】——首次互动就是送礼的新观众，
+      //   要先把这一单计进账本，他才有名次；放前面的话第一次送礼的人永远播不出来。
       //   身份取 evs[0]（translate 已做 7 嵌套×8 字段名容错），没翻译出事件则回退 dy.userOf。
       ut.noteInteraction(evs[0] || dy.userOf(item), broadcast, rank.worldRankOf, msgType === 'live_gift');
     }
     broadcast(events);
+    pushLedger();
     // TODO(联调)：收到并处理成功后，调抖音「履约数据上报」做 ack（去重 + 结算依据）。
     return json(res, 200, { ok: true, applied: events.length });
   }
@@ -271,11 +291,30 @@ const server = http.createServer(async (req, res) => {
   if ((path === '/round/start' || path === '/round/end') && req.method === 'POST') {
     let body = {}; try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
     const roomId = body.room_id || lastRoomId;
-    if (path === '/round/start') { dy.clearSides(); ut.resetRoundEnter(); rank.startRound(roomId, dyc.getAnchorOpenId()); currentRound = { id: currentRound.id + 1, status: 1 }; return json(res, 200, { ok: true, roomId, roundId: currentRound.id }); }
+    if (path === '/round/start') {
+      dy.clearSides(); ut.resetRoundEnter(); rank.startRound(roomId, dyc.getAnchorOpenId());
+      await ledger.loadPool(dyc.getAnchorOpenId());   // 先把底池读回来，再开局（顺序不能反：开局会 savePool）
+      ledger.startRound(dyc.getAnchorOpenId());
+      currentRound = { id: currentRound.id + 1, status: 1 };
+      pushLedger(true);
+      return json(res, 200, { ok: true, roomId, roundId: currentRound.id, pool: ledger.snapshot().pool });
+    }
     const winner = body.winner === 'left' || body.winner === 'right' ? body.winner : 'tie';
+    // ★结算在服务端算：客户端拿这份结果直接渲染，两边不会各算各的。
+    //   连不上服务端（纯 demo）时客户端仍用自己那套算 —— 见 src/score.js 的 settle。
+    // ⚠ 必须跑在 rank.endRound【之前】：上报给平台的 winning_streak_count 要的是本局结算【之后】
+    //   的连胜次数，而它是在 settle 里算的。顺序反了会永远少上报一局。
+    const result = ledger.settle(winner);
     rank.endRound(roomId, winner);
     currentRound.status = 2;
-    return json(res, 200, { ok: true, roomId, winner });
+    pushLedger(true);
+    return json(res, 200, { ok: true, roomId, winner, settle: result });
+  }
+  // 结转：客户端点结算面板「返回」时调 —— 积分池留 40% 当下一局底池
+  if (path === '/round/next' && req.method === 'POST') {
+    const p = ledger.nextRound();
+    pushLedger(true);
+    return json(res, 200, { ok: true, pool: p });
   }
 
   // ── 抖音云生产接入（真机）：4 接口，与上面 dev 的 /cb/*+SSE 并存 ──
@@ -333,6 +372,45 @@ const server = http.createServer(async (req, res) => {
     }
     const r = rank.resetWorld(body.prefix || '');
     console.log(`[world] 清榜 prefix=${body.prefix || '(全清)'} removed=${r.removed} left=${r.left}`);
+    return json(res, 200, { ok: true, ...r });
+  }
+  // ── 积分池底池（服务端存档，见 pool.js）──
+  //   GET  /api/pool             → {pool, open, anchor}；客户端开局时拉，服务端值【压过】本机 localStorage
+  //   POST /api/pool {pool,open} → 客户端结转后推上来（局中也有 3s 防抖心跳，防中途崩丢池子）
+  //   主播身份由服务端自己认（/start_game 置换出来的 anchorOpenId），客户端不传、也伪造不了。
+  if (path === '/pool' && req.method === 'GET') {
+    await pool.ready();     // 别在还没从 Redis 读回来时就答复 —— 客户端会拿 ready:false 之外的空池覆盖本地
+    return json(res, 200, { ok: true, ...pool.get(dyc.getAnchorOpenId()) });
+  }
+  if (path === '/pool' && req.method === 'POST') {
+    let body = {}; try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
+    if (body.pool == null) return json(res, 400, { ok: false, err: 'pool required' });
+    const r = await pool.set(dyc.getAnchorOpenId(), body.pool, body.open);
+    console.log(`[pool] 存档 anchor=${r.anchor.slice(0, 10)}… pool=${r.pool} open=${r.open}`);
+    return json(res, 200, { ok: true, ...r });
+  }
+  // 运维：清底池。鉴权同 /world/reset —— 它能抹掉主播攒了很多局的池子，不许裸开。
+  if (path === '/pool/reset' && req.method === 'POST') {
+    let body = {}; try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
+    const tok = req.headers['x-admin-token'] || body.token || '';
+    if (!cfg.APPSECRET || tok !== cfg.APPSECRET) return json(res, 403, { ok: false, err: 'forbidden' });
+    const r = await pool.reset(body.prefix || '');
+    console.log(`[pool] 清底池 prefix=${body.prefix || '(全清)'} removed=${r.removed}`);
+    return json(res, 200, { ok: true, ...r });
+  }
+  // ── 玩法积分账本（server/ledger.js）──
+  //   GET  /api/ledger          → 整份快照（客户端断线兜底 + 人工查账）
+  //   POST /api/ledger/reset    → 清账（同 /world/reset 鉴权；联调假号用 prefix 定点清）
+  if (path === '/ledger' && req.method === 'GET') {
+    await ledger.ready();
+    return json(res, 200, { ok: true, ...ledger.snapshot() });
+  }
+  if (path === '/ledger/reset' && req.method === 'POST') {
+    let body = {}; try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
+    const tok = req.headers['x-admin-token'] || body.token || '';
+    if (!cfg.APPSECRET || tok !== cfg.APPSECRET) return json(res, 403, { ok: false, err: 'forbidden' });
+    const r = await ledger.reset(body.prefix || '');
+    console.log(`[ledger] 清账 prefix=${body.prefix || '(全清)'} removed=${r.removed} left=${r.left}`);
     return json(res, 200, { ok: true, ...r });
   }
   // 诊断(临时):手动打选队三 API 看真实 err_no。GET /api/selftest_team?anchor=<主播openid>

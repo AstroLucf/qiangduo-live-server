@@ -19,6 +19,7 @@ const http = require('http');
 const dy = require('./douyin');
 const rank = require('./ranking');
 const cfg = require('./config');
+const ledger = require('./ledger');   // 玩法积分账本：真机这条路也必须记，否则线上账是空的
 
 const APP_ID = cfg.APPID;
 const OPENAPI_HOST = 'webcast-bytedance-com.openapi.dyc.ivolces.com';  // 内网专线 OpenAPI：免 token/https
@@ -154,17 +155,15 @@ async function liveDataCallback(headers, rawBody) {
       ' anchor=' + (headers['x-anchor-openid'] ? '头携带' : (lastAnchorOpenId ? '回退开局存的' : '⚠️空(下行会丢,exe 没开过局?)')));
   for (const item of items) {
     const events = dy.translate(msgType, item, cfg.DEFAULT_SIDE);     // → [{side,key,count}]
+    for (const ev of events) ledger.record(ev);                       // 玩法积分入账（唯一真源，与 dev 的 /cb/* 同一口径）
     if (events.length) {
       log('→ 翻译', JSON.stringify(events), '下行至', anchorOpenId ? (anchorOpenId.slice(0, 10) + '…') : '⚠️无openid(不下行)');
       await pushToClient(anchorOpenId, item.msg_id, msgType, JSON.stringify(events));
     } else {
       log('→ 翻译为空 type=' + msgType + ' gift_id=' + (item.sec_gift_id || '-') + ' val=' + (item.gift_value || item.diamond || '-') + '(礼物没置顶映射? 或未选队且 DEFAULT_SIDE=ignore?)');
     }
-    // 战绩累计（礼物驱动每用户分）
-    if (msgType === 'live_gift') {
-      const openId = dy.userOf(item).openid;     // 与 dev(index.js)对齐：7 嵌套×8 字段名容错，避免真机字段名不符时 openId 取空、战绩静默丢失
-      rank.recordGift({ openId, side: dy.sideOf(openId, cfg.DEFAULT_SIDE), value: item.gift_value || item.diamond, roomId: item.room_id || '' });
-    }
+    // 战绩累计已并入上面那行 ledger.record()：礼物/点赞/评论统一按 pts 计，
+    // 不再按 gift_value 单独记礼物（真机 gift_value = 抖币×10，与客户端口径差 10 倍，见 gifts.js）。
   }
   return items.length;
 }

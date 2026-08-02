@@ -1,0 +1,80 @@
+// ============================================================
+//  server/pool.js · 积分池「底池」的服务端存档
+//  ------------------------------------------------------------
+//  为什么必须放服务端（2026-08-02 用户指出）：
+//    底池最初写在客户端 localStorage 里，那是【主播那台电脑】上的浏览器存储 ——
+//    换电脑、重装、清缓存全没了，而且没有任何人↔分数的权威归属。
+//    积分池是要真金白银分给观众的，真源只能在服务端。
+//
+//  存什么：按【主播 openid】一人一格（底池跟主播走，不跟直播间走 —— room_id 每次开播都变）。
+//    { p: 当前积分池值, o: 是否还没结转, t: 最后更新时间 }
+//    o(open) 的意义见 src/score.js 的 roundOpen：主播可能结算面板开着就关 exe，
+//    那一局没走过结转 → 下次开播要补一次，否则底池带 100% 越滚越大。
+//
+//  拿不到主播 openid 时（exe 没走 /start_game、token 置换失败）落 'default' 这一格 ——
+//  宁可全主播共用一格，也别整个功能失效。真机只要正常开局就拿得到。
+//
+//  Redis 没开通 → 退化成进程内存（重启即丢），行为不比改动前差，且绝不拖垮主链路。
+// ============================================================
+'use strict';
+const kv = require('./kv');
+
+const KEY = 'qd:pool';          // Redis hash：field = 主播 openid，value = JSON
+const DEFAULT_ANCHOR = 'default';
+const mem = new Map();          // anchor -> {p,o,t}；Redis 的本地镜像 + 无 Redis 时的兜底
+let hydrated = false;
+
+function log(...a) { console.log('[pool]', ...a); }
+const norm = (a) => String(a || '').trim() || DEFAULT_ANCHOR;
+
+// 启动时把整张表读回内存：GET /pool 要同步返回，不能每次都等一趟 Redis 往返。
+async function hydrate() {
+  if (!kv.enabled) { hydrated = true; return; }
+  const h = await kv.hgetall(KEY);
+  // ★读失败【绝不】置 hydrated：否则 get() 会报 ready:true 并返回空池，
+  //   客户端信了就把主播攒了很多局的底池当成 0 覆盖掉 —— 这是最贵的一种错。
+  if (!h) { log('底池读取失败（Redis 未就绪？）→ 保持 ready:false，客户端会退回本机缓存'); return; }
+  let n = 0;
+  for (const a in h) {
+    try { const v = JSON.parse(h[a]); mem.set(a, { p: +v.p || 0, o: !!v.o, t: v.t || 0 }); n++; } catch (_) {}
+  }
+  hydrated = true;
+  log(`底池已从持久化恢复 ${n} 位主播` + (n ? '：' + [...mem.entries()].map(([a, v]) => a.slice(0, 8) + '…=' + v.p).join(' ') : ''));
+}
+// 客户端开局第一件事就是 GET /pool，很可能【早于】下面那次延迟 hydrate。
+// ready() 保证：没读回来之前先读一次（并发只走一趟），读不到就如实报 ready:false。
+let _hydrating = null;
+function ready() {
+  if (hydrated) return Promise.resolve();
+  if (!_hydrating) _hydrating = hydrate().catch(() => {}).then(() => { _hydrating = null; });
+  return _hydrating;
+}
+const _boot = setTimeout(hydrate, 800);   // 与 ranking 的 hydrateWorld 同节奏：等 kv 连上再读
+if (_boot.unref) _boot.unref();
+
+function get(anchor) {
+  const a = norm(anchor);
+  const v = mem.get(a) || mem.get(DEFAULT_ANCHOR) || { p: 0, o: false, t: 0 };
+  return { anchor: a, pool: Math.max(0, Math.round(v.p || 0)), open: !!v.o, at: v.t || 0, ready: hydrated };
+}
+
+// 客户端每局结转后（以及局中低频心跳）推上来。写内存 + 落 Redis，失败不抛。
+async function set(anchor, pool, open) {
+  const a = norm(anchor);
+  const v = { p: Math.max(0, Math.round(+pool || 0)), o: !!open, t: Date.now() };
+  mem.set(a, v);
+  if (kv.enabled) await kv.hset(KEY, [a, JSON.stringify(v)]);
+  return get(a);
+}
+
+// 运维：清某个主播（或全部）的底池。前缀空串 = 清全部。
+async function reset(prefix) {
+  const hit = [...mem.keys()].filter((a) => !prefix || a.startsWith(prefix));
+  hit.forEach((a) => mem.delete(a));
+  if (kv.enabled && hit.length) await kv.hdel(KEY, hit);
+  return { removed: hit.length, anchors: hit };
+}
+
+function diag() { return { anchors: mem.size, hydrated, kv: kv.enabled, list: [...mem.entries()].map(([a, v]) => ({ anchor: a, pool: v.p, open: v.o })) }; }
+
+module.exports = { get, set, reset, diag, hydrate, ready };

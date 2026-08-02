@@ -6,7 +6,7 @@
 //  + 对局(本局榜)编排 + 世界榜(跨场月榜)编排 + 世界榜定时刷新。
 //
 //  对外（被 index.js 调用）：
-//    recordGift({openId, side, value, roomId})  收到礼物时累计该用户战绩
+//    （战绩累计已移出本模块 → server/ledger.js，本模块只读它上报）
 //    startRound(roomId)                          对局开始（同步开始状态）
 //    endRound(roomId, winnerSide)                对局结束（排名→上报→完成）
 //    startWorldCron() / stopWorldCron()          世界榜定时刷新（每30s）
@@ -23,7 +23,7 @@
 'use strict';
 const https = require('https');
 const cfg = require('./config');
-const kv = require('./kv');        // 世界榜持久化（抖音云 Redis·没配环境变量则整体 no-op）
+const ledger = require('./ledger');   // 玩法积分账本 = 唯一真源；本模块只把它上报给抖音平台
 
 // ---- 配置（APPID/APPSECRET 来自 config；其余读环境变量）----
 const APP_ID = cfg.APPID;                                   // tt62e91454fc8d46c610
@@ -86,86 +86,31 @@ async function call(path, body, _retried) {
   return r;
 }
 
-// ---------- 战绩累计 ----------
-// round: roomId -> { roundId, startTime, users:Map<openId,{score,side}> }
-// world: openId -> { score, streak, lastWin }   （跨场累计；★ 进程内存，重启即丢，生产需落盘/KV，见联调清单）
-const rounds = new Map();
-const world = new Map();
+// ---------- 战绩来源 ----------
+// ★2026-08-02 重构：本模块【不再自己攒账】，只负责把账上报给抖音平台。
+//   数据全部读 server/ledger.js —— 那是玩法积分的唯一真源（客户端结算面板看到的也是它）。
+//
+//   为什么必须合并：旧代码这里有一本独立的 world/rounds，按【gift_value】累计；
+//   而客户端按【pts】累计。真机 gift_value = 抖币×10，且这里压根不记点赞/评论 ——
+//   于是同一个观众，小摇杆世界榜上的分是结算面板里的十几倍，两个数永远对不上。
+//   现在统一到 ledger 的 pts 口径：主播、观众、平台三处看到的是同一个数。
+//
+//   rounds 只留【平台需要的对局元信息】（round_id / start_time / 该场主播），
+//   参与者和分数临上报时从 ledger 现取。
+const rounds = new Map();   // roomId -> { roundId, startTime, anchor }
 
-// ============================================================
-//  世界榜持久化（2026-08-01 加）
-//  ------------------------------------------------------------
-//  world 原本是纯进程内存 → 实例每重启/每部署一次，全部观众的累计战绩清零。
-//  而入场视频档位、小摇杆世界榜名次全靠它，上线后一天部署两次就等于清两次。
-//  ★只持久化 world，不持久化 rounds：一局是短命的，endRound 上报完就该丢；
-//    真在局中挂了那一局的明细丢掉可接受，而 world 是跨场累计、丢了没法重建。
-//  ★写入用【脏集合 + 定时批量 HSET】而不是每次送礼都写：礼物风暴时一秒几十次，
-//    逐次写纯属浪费；攒 2s 一次批量写，丢的最多是最后 2 秒（下一局照样能累计回来）。
-//  ★key 带世界榜版本(月) → 跨月自然换新表，与上报给平台的 world_rank_version 口径一致。
-// ============================================================
-const worldKey = () => 'qd:world:' + worldVersion();
-let _dirty = new Set(), _flushT = null, _hydrated = false;
+// 持久化已随账本一起搬到 ledger.js（Redis hash `qd:acct`）。
+// 旧的 `qd:world:month_*` 不再读写 —— 那是 gift_value 口径的老表，与新账本单位不同，
+// 混用只会让名次错乱。内测期无真实数据，直接弃用；要清可 `/api/ledger/reset`。
 
-function markDirty(openId) {
-  if (!kv.enabled) return;
-  _dirty.add(openId);
-  if (_flushT) return;
-  _flushT = setTimeout(() => { _flushT = null; flushWorld().catch(() => {}); }, 2000);
-  if (_flushT.unref) _flushT.unref();
-}
-async function flushWorld() {
-  if (!kv.enabled || !_dirty.size) return;
-  const ids = [..._dirty]; _dirty.clear();
-  const pairs = [];
-  for (const id of ids) { const w = world.get(id); if (w) pairs.push(id, JSON.stringify(w)); }
-  // 已被 resetWorld 删掉的（world 里没有了）→ 从 Redis 也删掉，别让它复活
-  const gone = ids.filter((id) => !world.has(id));
-  if (pairs.length) await kv.hset(worldKey(), pairs);
-  if (gone.length) await kv.hdel(worldKey(), gone);
-}
-// 启动时把上次的累计读回来。读失败/未启用 → world 保持空，行为同改动前。
-async function hydrateWorld() {
-  if (!kv.enabled || _hydrated) return;
-  const o = await kv.hgetall(worldKey());
-  if (!o) { log('世界榜持久化未就绪(Redis 未连上)，本次以空表启动'); return; }
-  let n = 0;
-  for (const [id, s] of Object.entries(o)) {
-    try { const w = JSON.parse(s); if (w && typeof w.score === 'number') { world.set(id, w); n++; } } catch (_) {}
-  }
-  _hydrated = true;
-  log('世界榜已从持久化恢复', n, '人 · key=' + worldKey());
-}
-if (kv.enabled) setTimeout(() => hydrateWorld().catch((e) => log('恢复失败', e.message)), 800).unref();
-
-function recordGift({ openId, side, value, roomId }) {
-  if (!ENABLED || !openId) return;
-  const v = Math.max(0, Number(value) || 0);
-  // 本局累计
-  let R = rounds.get(roomId);
-  if (R) { const u = R.users.get(openId) || { score: 0, side }; u.score += v; u.side = side; R.users.set(openId, u); }
-  // 世界累计
-  const w = world.get(openId) || { score: 0, streak: 0, lastWin: false };
-  w.score += v; world.set(openId, w);
-  markDirty(openId);
-}
-
-// 排序取榜：[{openId, score, side}] desc，附 rank（>1000 封顶）
-function rankList(map) {
-  const arr = [...map.entries()].map(([openId, u]) => ({ openId, ...u })).sort((a, b) => b.score - a.score);
-  arr.forEach((u, i) => { u.rank = Math.min(i + 1, RANK_CAP); });
-  return arr;
-}
 function chunk(arr, n) { const o = []; for (let i = 0; i < arr.length; i += n) o.push(arr.slice(i, i + n)); return o; }
 const nowSec = () => Math.floor(Date.now() / 1000);
 
-// 查某 open_id 在世界榜(world 跨场累计)的名次(1-based)；不在榜返回 0。用于观众进场判定「世界榜前十」。
-// ⚠ world 是进程内存·多实例不共享·重启即丢（同联调清单）→ 进场判定同样受限，放量须随 world 一起上 KV。
-function worldRankOf(openId) {
-  if (!ENABLED || !openId || !world.has(openId)) return 0;
-  const ranked = rankList(world);
-  const idx = ranked.findIndex((u) => u.openId === openId);
-  return idx < 0 ? 0 : idx + 1;
-}
+// 查某 open_id 的世界榜名次(1-based)；不在榜返回 0。入场视频档位靠它（前百分档播不同视频）。
+// ★口径 = 账本的 total（总积分），与玩法里「世界榜」的定义、结算面板那个 tab 完全一致。
+// ★不再受 ENABLED(APPSECRET) 门控：入场视频是玩法自己的表现，不该因为没配 secret 就整个失灵
+//   —— 旧代码那个门控是因为名次算在上报模块里，属于历史耦合。
+function worldRankOf(openId) { return ledger.rankOfTotal(openId); }
 
 // 用户快捷选队②:上报观众阵营(gaming_con/round/upload_user_group_info·观众加入阵营时调)。
 // group_id=side(left/right·与后台 Group_ID 一致);round_id 取当前对局(无则 nowSec 兜)。无 secret 静默降级。
@@ -199,7 +144,7 @@ async function startRound(roomId, anchorOpenId) {
   if (!ENABLED || !roomId) return;
   const anchor = anchorOpenId || ANCHOR_OPEN_ID;  // 当前对局主播 openid（start_game 用主播 token 动态换出）·env 仅兜底
   const roundId = nowSec();                       // round_id 同房间内递增，用开局时间戳（文档建议）
-  rounds.set(roomId, { roundId, startTime: roundId, users: new Map(), anchor });
+  rounds.set(roomId, { roundId, startTime: roundId, anchor });   // 只存元信息，参与者临上报时从 ledger 取
   try {
     await call('round/sync_status', { app_id: APP_ID, anchor_open_id: anchor, room_id: roomId, round_id: roundId, start_time: roundId, status: 1 });
     log('对局开始', roomId, '#' + roundId, '主播', (anchor || '(空)').slice(0, 8));
@@ -218,11 +163,13 @@ async function endRound(roomId, winnerSide) {
   if (!R) { log('endRound: 无活动对局', roomId); return; }
   const anchor = R.anchor || ANCHOR_OPEN_ID;      // 用开局存的该场主播 openid·env 兜底
   const end = nowSec();
-  const ranked = rankList(R.users);
+  // 本局参与者从账本现取（fresh = 本局贡献，pts 口径，与客户端结算面板同一个数）。
+  // ★index.js 里 ledger.settle() 跑在本函数【之前】，所以 winStreak 已是本局结果，可直接上报。
+  const ranked = ledger.roundList();
   const userItems = ranked.map((u) => ({
     open_id: u.openId, rank: u.rank, score: u.score,
     round_result: roundResultOf(u.side, winnerSide),
-    winning_points: u.score, winning_streak_count: 0,
+    winning_points: u.score, winning_streak_count: u.winStreak || 0,
   }));
   const groupResult = [
     { group_id: 'left', result: winnerSide === 'tie' ? 3 : (winnerSide === 'left' ? 1 : 2) },
@@ -242,14 +189,8 @@ async function endRound(roomId, winnerSide) {
     log('对局结束上报完成', roomId, '#' + R.roundId, '参与', userItems.length, '胜方', winnerSide);
   } catch (e) { log('endRound 失败', e.message); }
 
-  // 世界累计连胜（赢的一方 +1，输的清零）
-  for (const u of ranked) {
-    const w = world.get(u.openId); if (!w) continue;
-    const win = winnerSide !== 'tie' && u.side === winnerSide;
-    w.streak = win ? (w.streak || 0) + 1 : 0; w.lastWin = win;
-    markDirty(u.openId);
-  }
-  flushWorld().catch(() => {});     // 局末立刻落一次，别等 2s 定时器（这会儿最容易被部署打断）
+  // 连胜次数已由 ledger.settle() 在结算时算好并落盘（原本这里再算一遍 = 两套连胜口径打架）。
+  ledger.flush().catch(() => {});   // 局末立刻落一次，别等 2s 定时器（这会儿最容易被部署打断）
   rounds.delete(roomId);
   worldTick().catch(() => {});                     // 对局结束顺手刷一次世界榜
 }
@@ -275,13 +216,15 @@ async function worldEnsureVersion() {
 
 let _worldBusy = false;
 async function worldTick() {
-  if (!ENABLED || _worldBusy || world.size === 0) return;
+  if (!ENABLED || _worldBusy || ledger.size() === 0) return;
   _worldBusy = true;
   try {
     await worldEnsureVersion();
     const v = _curVer || worldVersion();
-    const ranked = rankList(world);                // 世界 item：无 round_result/room/round
-    const items = ranked.map((u) => ({ open_id: u.openId, rank: u.rank, score: u.score, winning_points: u.score, winning_streak_count: u.streak || 0 }));
+    // ★平台世界榜按【月分】排：world_rank_version 是 month_YYYYMM，跨月自然换榜，
+    //   和账本 month 字段同周期。（入场视频档位用的是 total，两者定义不同，见 worldRankOf）
+    const ranked = ledger.worldList();             // 世界 item：无 round_result/room/round
+    const items = ranked.map((u) => ({ open_id: u.openId, rank: u.rank, score: u.score, winning_points: u.score, winning_streak_count: u.winStreak || 0 }));
     // 榜单区 Top150（qps 5/s，建议 30s 一次）
     await call('world_rank/upload_rank_list', { app_id: APP_ID, is_online_version: IS_ONLINE, world_rank_version: v, rank_list: items.slice(0, RANK_TOP) });
     // 个人数据区：前 1000 名（准实时），分批 ≤50
@@ -305,37 +248,16 @@ function stopWorldCron() { if (_cron) { clearInterval(_cron); _cron = null; } }
 // ★为什么需要它（2026-08-01）：world 是进程内存，联调时打的测试假号会一直占着榜前排，
 //   真实观众名次被挤到后面、入场视频档位就不对。以前只能靠「重新部署一次」冲掉——
 //   而部署要登控制台，登录态一掉就卡死。有了这条，一行 curl 定点清，不惊动线上。
-function resetWorld(prefix) {
-  const before = world.size;
-  const samples = [];
-  const killed = [];
-  if (prefix) {
-    for (const k of [...world.keys()]) if (k.startsWith(prefix)) { world.delete(k); killed.push(k); if (samples.length < 10) samples.push(k); }
-  } else {
-    for (const k of [...world.keys()]) { killed.push(k); if (samples.length < 10) samples.push(k); }
-    world.clear();
-  }
-  // ★同步删持久化，否则下次重启又被 hydrate 回来（清了个寂寞）
-  if (kv.enabled) {
-    if (prefix) kv.hdel(worldKey(), killed).catch(() => {});
-    else kv.del(worldKey()).catch(() => {});
-    killed.forEach((k) => _dirty.delete(k));
-  }
-  return { removed: before - world.size, left: world.size, samples, persisted: kv.enabled };
-}
-
-// 只读：看世界榜当前都有谁（排查"名次为什么是这个"用）。limit 默认 20。
-function worldPeek(limit) {
-  return rankList(world).slice(0, Math.max(1, Math.min(+limit || 20, 150)))
-    .map((u) => ({ open_id: u.openId, rank: u.rank, score: u.score }));
-}
+// 清榜/查榜都转给账本（同一本账，别再开第二个入口）。
+const resetWorld = (prefix) => ledger.reset(prefix);
+const worldPeek = (limit) => ledger.peek(limit);
 
 module.exports = {
   enabled: ENABLED,
-  recordGift, startRound, endRound, uploadUserGroup, selfTestTeam,
+  startRound, endRound, uploadUserGroup, selfTestTeam,
   worldEnsureVersion, worldTick, startWorldCron, stopWorldCron, worldRankOf,
   resetWorld, worldPeek,
-  _state: { rounds, world },     // 自测用
+  _state: { rounds },     // 自测用
 };
 
 // ============================================================
