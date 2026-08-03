@@ -160,7 +160,9 @@ const server = http.createServer(async (req, res) => {
       battery: has('battery'), mic: has('mic'), airdrop: has('airdrop'),
     };
     // kv：世界榜持久化是否真的接上了（开通 Redis 后一眼确认，不用翻日志）
-    return json(res, 200, { ok: true, instance: INSTANCE_ID, bootAt: BOOT_AT, clients: clients.size, sseSeen, appid: cfg.APPID, skipSign: cfg.DEV_SKIP_SIGN, defaultSide: cfg.DEFAULT_SIDE, giftMap, kv: kv.diag(), pool: pool.diag(), ledger: ledger.diag() });
+    return json(res, 200, { ok: true, instance: INSTANCE_ID, bootAt: BOOT_AT, clients: clients.size, sseSeen, appid: cfg.APPID, skipSign: cfg.DEV_SKIP_SIGN, defaultSide: cfg.DEFAULT_SIDE, giftMap, kv: kv.diag(), pool: pool.diag(), ledger: ledger.diag(),
+      // 上线体检：这三项任一为"裸奔"就别对外开播（cbKey 未设 且 跳过验签 = /cb/* 全网可打）
+      guard: { cbKey: !!cfg.CB_KEY, verifySign: !cfg.DEV_SKIP_SIGN, rankOnline: process.env.RANK_ONLINE === '1', mock: cfg.ALLOW_MOCK } });
   }
 
   // 诊断：最近广播的事件（自查工具/真机推送后，看服务端翻译+广播了什么——即使没有游戏连着也能看）。
@@ -225,17 +227,17 @@ const server = http.createServer(async (req, res) => {
   if (path.startsWith('/cb/') && req.method === 'POST') {
     const msgType = MSGTYPE[path.slice(4)];
     if (!msgType) return json(res, 404, { ok: false, err: 'unknown callback' });
+    // ★口令校验（见 config.js 的 CB_KEY）：/cb/* 是生产链路且当前不验签，
+    //   不设口令就是公网裸奔。回一个 404 而不是 401 —— 别告诉扫描器"这里有东西、只是口令不对"。
+    if (cfg.CB_KEY && u.searchParams.get('k') !== cfg.CB_KEY) {
+      console.warn(`[cb] 口令不符，拒绝 ${msgType}（回调地址是不是漏了 ?k=）`);
+      return json(res, 404, { ok: false, err: 'not found' });
+    }
     const raw = await readBody(req);
     // 沙盒期抓字段：完整打印抖音推来的原始头+体，用首条真实样例锁 douyin.js 的 GIFT_ID_TO_KEY。上生产前收掉这行。
     console.log(`[cb] ${msgType}  x-msg-type=${req.headers['x-msg-type'] || '-'}  x-roomid=${req.headers['x-roomid'] || '-'}  x-signature=${req.headers['x-signature'] ? 'present' : '-'}  raw=${raw}`);
-    // ★2026-07-30 临时诊断：把【所有 x-* 头】原样打一遍，找合法的 anchor_open_id。
-    //   背景：发版检查要三个对局 API 的"成功调用记录"，而 sync_status 必填 anchor_open_id。
-    //   自查工具的「用户 openID」(19位纯数字 UID) 实测被判「参数 anchor_open_id 不合法」，
-    //   真主播 openid 目前只能靠 /start_game 的 token 置换拿 —— 但那需要直播伴侣启动 exe。
-    //   如果平台在回调头里就带了主播身份(如 x-anchor-openid)，就能省掉整个开播环节。
-    //   ⚠ 联调完删掉这行：它会把全部请求头打进日志。
-    console.log(`[cb-hdr] ${msgType} ` + JSON.stringify(
-      Object.fromEntries(Object.entries(req.headers).filter(([k]) => k.startsWith('x-')))));
+    // （2026-07-30 那条 [cb-hdr] 全头转储已删：它把 x-signature 也打进日志了，上线前必须收掉。
+    //   当初是为了从回调头里找主播 openid，结论是头里没有，只能靠 /start_game 的 token 置换。）
     if (!cfg.DEV_SKIP_SIGN && !dy.verifySign(req.headers, raw, cfg.APPSECRET)) {
       return json(res, 401, { ok: false, err: 'bad signature' });
     }

@@ -16,6 +16,15 @@ module.exports = {
   // 正式联调把它置 0，并在 douyin.js 里用「签名调试工具」校准验签算法。
   DEV_SKIP_SIGN: (process.env.DEV_SKIP_SIGN || '1') === '1',
 
+  // ★回调口令（2026-08-02 上线加固）：设了之后 /cb/* 必须带 ?k=<CB_KEY> 才受理。
+  //   为什么需要它：/cb/* 是【生产链路】（真机礼物就是从这里进来 → broadcast → SSE → 游戏），
+  //   而 DEV_SKIP_SIGN=1 时它不验签 —— 任何人拿到域名就能 POST 伪造礼物、左右胜负、刷积分榜。
+  //   正解是把 verifySign 按官方「签名调试工具」校准后置 DEV_SKIP_SIGN=0，但那要时间；
+  //   而回调 URL 是我们自己填给抖音的，可以直接带 query 参数 —— 抖音会原样 POST 过来。
+  //   于是一个随机长串就把公网裸奔堵上了，且完全不依赖验签算法能不能跑通。
+  //   ⚠ 不设 = 保持原行为（不校验），本机开发不受影响。
+  CB_KEY: process.env.CB_KEY || '',
+
   // 选队数据未知时，礼物默认归哪边：'ignore'(丢弃) / 'left' / 'right'。
   // 正式期观众都会先「选队」，应保持 ignore；本机自测可临时设 left/right。
   DEFAULT_SIDE: process.env.DEFAULT_SIDE || 'ignore',
