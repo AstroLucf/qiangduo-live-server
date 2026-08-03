@@ -106,6 +106,30 @@ const rounds = new Map();   // roomId -> { roundId, startTime, anchor }
 function chunk(arr, n) { const o = []; for (let i = 0; i < arr.length; i += n) o.push(arr.slice(i, i + n)); return o; }
 const nowSec = () => Math.floor(Date.now() / 1000);
 
+// ── 🔴 上报前过滤不合法 open_id（2026-08-03 加）────────────────────────────
+//  平台对榜单是【整批校验】：列表里只要有一个不合法的 open_id，
+//  就回 err=40001「请检查榜单列表的open_id是否合法」→ **整批被拒**，
+//  真实观众的战绩跟着一起丢，而且每 30s 世界榜定时刷一次、报一次。
+//  实际毒源有两类，都不是真观众：
+//    · 联调/压测打的探针（如 `_000E2E_A`）
+//    · 自查工具的「用户 openID」= 19 位纯数字 UID（早前实测被判 anchor_open_id 不合法）
+//
+//  真 open_id 实测格式：下划线开头、总长 36（见过的全是 `_000` + 32 位）。
+//    _0009btKCMh0eFK1D4S1W0u8RxES_hdQJF08
+//    _000A4DkE9QJzyD396XdONHP_382Gvk__VD_
+//  这里【不】写死 `_000` 前缀：万一平台换前缀，写死会把所有真人一起丢掉且毫无察觉。
+//  只卡「下划线开头 + 36 位 + 合法字符集」，足够挡住上面两类，又留了余量。
+//
+//  ★丢弃必须打日志：静默截断会让"上报成功"看起来一切正常，实际少报了人。
+const OPEN_ID_RE = /^_[A-Za-z0-9_-]{35}$/;
+function uploadable(list, what) {
+  const ok = list.filter((u) => OPEN_ID_RE.test(u.openId));
+  const bad = list.filter((u) => !OPEN_ID_RE.test(u.openId));
+  if (bad.length) log(`⚠️ ${what}：过滤掉 ${bad.length} 个不合法 open_id（不上报，避免整批被拒）→ ` +
+    bad.slice(0, 3).map((u) => u.openId).join(' , ') + (bad.length > 3 ? ' …' : ''));
+  return ok;
+}
+
 // 查某 open_id 的世界榜名次(1-based)；不在榜返回 0。入场视频档位靠它（前百分档播不同视频）。
 // ★口径 = 账本的 total（总积分），与玩法里「世界榜」的定义、结算面板那个 tab 完全一致。
 // ★不再受 ENABLED(APPSECRET) 门控：入场视频是玩法自己的表现，不该因为没配 secret 就整个失灵
@@ -116,6 +140,8 @@ function worldRankOf(openId) { return ledger.rankOfTotal(openId); }
 // group_id=side(left/right·与后台 Group_ID 一致);round_id 取当前对局(无则 nowSec 兜)。无 secret 静默降级。
 async function uploadUserGroup(openId, groupId, roomId) {
   if (!ENABLED || !openId || (groupId !== 'left' && groupId !== 'right')) return;
+  // 同 uploadable：探针/自查工具的假 id 打这个接口只会拿一堆 40001 刷屏，直接不发
+  if (!OPEN_ID_RE.test(openId)) return;
   const R = roomId && rounds.get(roomId);
   const roundId = R ? R.roundId : nowSec();
   try {
@@ -165,7 +191,7 @@ async function endRound(roomId, winnerSide) {
   const end = nowSec();
   // 本局参与者从账本现取（fresh = 本局贡献，pts 口径，与客户端结算面板同一个数）。
   // ★index.js 里 ledger.settle() 跑在本函数【之前】，所以 winStreak 已是本局结果，可直接上报。
-  const ranked = ledger.roundList();
+  const ranked = uploadable(ledger.roundList(), '本局榜');
   const userItems = ranked.map((u) => ({
     open_id: u.openId, rank: u.rank, score: u.score,
     round_result: roundResultOf(u.side, winnerSide),
@@ -223,7 +249,8 @@ async function worldTick() {
     const v = _curVer || worldVersion();
     // ★平台世界榜按【月分】排：world_rank_version 是 month_YYYYMM，跨月自然换榜，
     //   和账本 month 字段同周期。（入场视频档位用的是 total，两者定义不同，见 worldRankOf）
-    const ranked = ledger.worldList();             // 世界 item：无 round_result/room/round
+    const ranked = uploadable(ledger.worldList(), '世界榜');   // 世界 item：无 round_result/room/round
+    if (!ranked.length) { log('世界榜：过滤后无可上报数据，跳过本次'); return; }
     const items = ranked.map((u) => ({ open_id: u.openId, rank: u.rank, score: u.score, winning_points: u.score, winning_streak_count: u.winStreak || 0 }));
     // 榜单区 Top150（qps 5/s，建议 30s 一次）
     await call('world_rank/upload_rank_list', { app_id: APP_ID, is_online_version: IS_ONLINE, world_rank_version: v, rank_list: items.slice(0, RANK_TOP) });
