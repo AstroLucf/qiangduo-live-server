@@ -76,9 +76,18 @@ function randSide() { return Math.random() < 0.5 ? 'right' : 'left'; }
 // 之后该用户【任何】互动都归这一队、本局内永不改(再喊别的队也不换)。
 // 开局 clearSides() 清空 → 下一局重新拉队。匿名无身份 → 每次随机、不锁。
 // 这是「随机落座与1/2选队地位相同、一旦落座不得修改」的服务端唯一真源(替代会覆盖的 setSide)。
-function lockSide(openid, prefer) {
+// ★2026-08-03 改（用户报「弹幕扣1去了2」）：显式意愿可以改队，隐式落座才锁死。
+//   原来 prefer 参数被整个忽略 —— 观众只要在扣「1」之前点过一次赞，就已被 hashSide 随机落座，
+//   之后再明确扣「1」只会被退回原队。表现就是「我明明扣了1，却被分到小美队」。
+//   现在分两类：
+//     · 隐式落座（礼物/点赞/666）→ 一旦落座本局不再变（防同一个人来回横跳刷两边推力）
+//     · 显式意愿（评论1/2 · 原生选队 · 小摇杆选队）→ 允许改队，观众说了算
+//   ⚠ explicit 只能由「观众主动指定阵营」的入口传 true。礼物/点赞传的是 DEFAULT_SIDE，
+//     那不是意愿、是兜底，绝不能当显式——否则 DEFAULT_SIDE 一配就把所有人反复拽到同一边。
+function lockSide(openid, prefer, explicit) {
   const chosen = chosenSide(openid);
-  if (chosen) return chosen;                                  // 已落座 → 永远归这边，不换
+  const wants = (prefer === 'left' || prefer === 'right');
+  if (chosen && !(explicit && wants)) return chosen;           // 已落座且非显式改队 → 归原队
   const side = (prefer === 'left' || prefer === 'right')
     ? prefer                                                  // 评论1/2/原生选队：按方向落座
     : (openid ? hashSide(openid) : randSide());               // 礼物/点赞/666：有身份哈希随机、匿名当次随机
@@ -138,14 +147,27 @@ function commentText(payload) {
 //  · 「1/大壮」「2/小美」严格命中 → 'left'/'right'：定向落座(可切队)
 //  · 含「666」或【纯 6 串】(6/66/6666…) → 'cheer'：加油(效果同点赞,见 main.js 的 GIFT_ALIAS)
 //  · 其余评论(闲聊)→ null：不落座、不下发
-// 选队词用【严格相等】匹配(数组 includes，不是 s.includes)，避免「怎么跑到左去了」这类含字误判落座。
-const LEFT_WORDS = ['1', '大壮', '帮大壮', '左'];
-const RIGHT_WORDS = ['2', '小美', '帮小美', '右'];
+// ★2026-08-03 放宽（用户报「扣2没下场」）：原来是【严格相等】匹配四个词，
+//   全角「２」、emoji「2️⃣」、「选2」「2号」「我选2」「2！」全部不认 → 直接丢弃、观众以为自己选了队。
+//   现在先归一化再用【锚定正则】匹配：既收掉这些写法，又不会被「2333」「11月」这类误伤
+//   （锚定 ^…$ 保证整条弹幕就是选队意图，不是含字就算）。
+//   ⚠ 别改成 s.includes('1')：那会把「11点了」「第1名」全判成选队，是本来要避免的坑。
+function normComment(content) {
+  return String(content || '')
+    .replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))  // 全角数字 ２→2
+    .replace(/[️⃣‍]/g, '')                                               // emoji 变体选择符 / keycap / 零宽连接
+    .replace(/[\s　]+/g, '')                                                        // 空格(含全角)
+    .replace(/[!！.。,，、~～?？:：;；\-—_]/g, '')                                       // 常见标点
+    .toLowerCase();
+}
+// 前缀=可选的动词（我选/投/支持/帮/加入/pick），后缀=可选的量词（号/队/边/方/组）
+const LEFT_RE = /^(?:我?选|投|支持|帮|加入|pick)?(?:1|一|大壮|左)(?:号|队|边|方|组)?$/;
+const RIGHT_RE = /^(?:我?选|投|支持|帮|加入|pick)?(?:2|二|小美|右)(?:号|队|边|方|组)?$/;
 function commentIntent(content) {
-  const s = String(content || '').trim();
+  const s = normComment(content);
   if (!s) return null;
-  if (LEFT_WORDS.includes(s)) return 'left';
-  if (RIGHT_WORDS.includes(s)) return 'right';
+  if (LEFT_RE.test(s)) return 'left';
+  if (RIGHT_RE.test(s)) return 'right';
   // 「666」子串 已覆盖 666/6666…/牛666啊；再补【纯 6 串】收掉直播间同样高频的「6」「66」。
   // ⚠ 必须放在 LEFT/RIGHT 之后：那两组是严格相等匹配，'1'/'2' 不会被这条抢走。
   if (s.includes('666') || /^6+$/.test(s)) return 'cheer';
@@ -191,10 +213,11 @@ function translate(msgType, payload, defaultSide) {
     }
     case 'live_comment': {
       const intent = commentIntent(commentText(payload));
-      if (intent === 'left' || intent === 'right') {         // 1/2 → 落座锁定：首次按方向落座；已落座归原队、不换
-        const first = !chosenSide(u.openid);                 // 之前没落座过 = 首次
-        const side = lockSide(u.openid, intent);             // 首次→按方向落座并锁;已落座→归原队(忽略这次喊的方向)
-        return [{ side, key: first ? 'join' : 'c666', count: 1, ...u }];  // 首次→加入(永久推力);已落座→只加力、不换队
+      if (intent === 'left' || intent === 'right') {         // 1/2 = 显式意愿 → 首次落座 / 已落座也允许改队
+        const prev = chosenSide(u.openid);                   // 改队前在哪边（''=没落座过）
+        const side = lockSide(u.openid, intent, true);        // explicit=true → 观众说了算
+        const switched = !!prev && prev !== side;             // 真的换边了 → 让客户端把他的小火箭挪过去
+        return [{ side, key: prev ? 'c666' : 'join', count: 1, switched, from: prev || '', ...u }];
       }
       if (intent === 'cheer') {                              // 666 → 落座锁定：首次随机落座并【加入】;已落座归原队加力
         const first = !chosenSide(u.openid);
@@ -203,12 +226,13 @@ function translate(msgType, payload, defaultSide) {
       }
       return [];                                             // 其余评论(闲聊)→ 不落座、不下发
     }
-    case 'team_select': {                                   // 原生选队：首次→落座加入;已落座→归原队只加力(不换、不重复刷)
+    case 'team_select': {                                   // 原生选队 = 显式意愿：首次落座 / 已落座也允许改队
       const raw = sideFromTeam(payload);
       if (!raw) return [];
-      const first = !chosenSide(u.openid);
-      const side = lockSide(u.openid, raw);                  // 首次→按选的队落座并锁;已落座→归原队
-      return [{ side, key: first ? 'join' : 'c666', count: 1, ...u }];
+      const prev = chosenSide(u.openid);
+      const side = lockSide(u.openid, raw, true);            // explicit=true，同评论 1/2
+      const switched = !!prev && prev !== side;
+      return [{ side, key: prev ? 'c666' : 'join', count: 1, switched, from: prev || '', ...u }];
     }
     default: return [];
   }

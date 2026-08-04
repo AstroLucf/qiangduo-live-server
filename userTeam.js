@@ -61,11 +61,13 @@ function userGroupPush(rawBody, round, broadcast, worldRankOf) {
   if (!want) {
     return { errcode: 0, errmsg: 'success', data: { round_id: round.id || 0, round_status: round.status || 2, group_id: dy.chosenSide(openId) || '' } };
   }
-  const first = !dy.chosenSide(openId);
-  const side = dy.lockSide(openId, want);                 // 首次→按选的落座并锁；已落座→归原队
+  // 小摇杆点按钮 = 最明确的显式意愿 → explicit=true，允许改队（同评论 1/2，见 douyin.js 的 lockSide）
+  const prev = dy.chosenSide(openId);
+  const side = dy.lockSide(openId, want, true);
   if ((side === 'left' || side === 'right') && typeof broadcast === 'function') {
     const user = { openid: openId, nickname: body.nickname || '', avatar: body.avatar_url || '' };
-    broadcast([{ side, key: first ? 'join' : 'c666', count: 1, ...user }]);
+    const switched = !!prev && prev !== side;             // 换边了 → 客户端把他的小火箭挪过去
+    broadcast([{ side, key: prev ? 'c666' : 'join', count: 1, switched, from: prev || '', ...user }]);
     // ★入场视频的【第二条】触发路径：小摇杆点选队按钮 = 最明确的"落座"动作。
     //   noteInteraction 与 /cb/* 共用 enteredThisRound，所以「先点按钮后送礼」不会重复播。
     noteInteraction(user, broadcast, worldRankOf, false);
