@@ -17,17 +17,26 @@
 'use strict';
 
 // key 与 douyin.js translate() 的产出、src/main.js 的 GIFTS 一一对应
+// ★★ 单位 = 【分】，整数，最小刻度 1（2026-08-03 统一，替换掉原来的"票"口径）★★
+//    内部存什么 → 屏幕显示什么 → 上报给抖音什么，三处同一个数，全程零换算。
+//    历史：原先内部按"票"记账、展示层 ×1000 变成分，两次踩坑——
+//      ① 2026-08-02 把「10 分」直接写成 10，实为 10 票 = 1 万分，点赞党灌爆世界榜；
+//      ② 改成 0.01 票后又撞上 pool.js 的 Math.round：49 次点赞 = 0.49 票，落盘取整直接归零，
+//         点赞根本进不了积分池。小数口径从根上就不成立。
+//    ⚠ 改这里必须同步改 src/main.js 的 GIFTS.pts（两边逐项相等），否则主播看到的分和账本对不上。
 const PTS = {
-  join: 1,        // 首次互动加入
-  like: 10,       // 点赞（2026-08-02 用户定：1 → 10）
-  c666: 10,       // 评论 666 / 纯 6 串：已并入点赞，分值必须与 like 相同
-  wand: 1,        // 仙女棒 1 抖币
-  pill: 10,       // 能力药丸 10
-  donut: 52,      // 甜甜圈 52
-  battery: 99,    // 能量电池 99
-  mic: 299,       // 派对话筒 299
-  airdrop: 520,   // 神秘空投 520
+  join: 1000,       // 首次互动加入
+  like: 10,         // 点赞（100 次点赞 = 一根仙女棒 ¥0.1）
+  c666: 10,         // 评论 666 / 纯 6 串：已并入点赞，分值必须与 like 相同
+  wand: 1000,       // 仙女棒    1 抖币
+  pill: 10000,      // 能力药丸  10 抖币
+  donut: 52000,     // 甜甜圈    52 抖币
+  battery: 99000,   // 能量电池  99 抖币
+  mic: 299000,      // 派对话筒  299 抖币
+  airdrop: 520000,  // 神秘空投  520 抖币
 };
+// 旧「票」口径 → 新「分」口径的换算系数。存量账本迁移用（见 ledger.js 的 migrateUnit）。
+const LEGACY_VOTE_TO_SCORE = 1000;
 
 // 免费互动(点赞/评论/加入) vs 付费礼物 —— 决定结算「全员分成资格」走哪条通道。
 // 与 src/main.js 里 `g.price > 0 ? 'gift' : 'like'` 同口径。
@@ -36,4 +45,4 @@ const PAID = { wand: 1, pill: 1, donut: 1, battery: 1, mic: 1, airdrop: 1 };
 const ptsOf = (key) => PTS[key] || 0;
 const isPaid = (key) => !!PAID[key];
 
-module.exports = { PTS, ptsOf, isPaid };
+module.exports = { PTS, ptsOf, isPaid, LEGACY_VOTE_TO_SCORE };

@@ -108,12 +108,35 @@ async function hydrate() {
   }
   hydrated = true;
   log(`账本已从持久化恢复 ${n} 人` + (wReset ? ' · 周榜已重置' : '') + (mReset ? ' · 月榜/连胜已重置' : ''));
-  if (wReset || mReset) { accounts.forEach((_, id) => _dirty.add(id)); await stampMeta(); await flush(); }
+  const migrated = await migrateUnit(meta, n);    // 票 → 分（只跑一次，见下）
+  if (wReset || mReset || migrated) { accounts.forEach((_, id) => _dirty.add(id)); await stampMeta(); await flush(); }
   else await stampMeta();
+}
+// ★存量单位迁移：票 → 分（2026-08-03 一次性）★
+//   2026-08-03 之前账本按"票"记账（仙女棒=1、药丸=10…），展示层再 ×1000 变成分；
+//   现在内部直接存分，存量必须整体 ×1000 才能和新数据同量纲，否则老用户的分会显得只有新用户的千分之一。
+//   ★用 META 里的 unit 字段做幂等标记 —— 重启/重新部署/多次 hydrate 都只会乘一次。
+//   ⚠ 不清账本是用户的明确决定：历史上点赞曾按 10 票(=1万分)记，那批虚高会被等比放大，属已知取舍。
+//   ⚠ dev 和 prod 各有独立 Redis，各自迁一次；部署后在日志里找 [ledger] 单位迁移 那行确认。
+//   ★底池不在这里迁★ —— 它是按主播 openid 分别存的、由 loadPool 在 /start_game 之后才读，
+//     晚于 hydrate。在这里迁只会迁到一个还没载入的 0，随后被读回的旧值原样覆盖。
+//     底池的迁移跟着记录走，在 pool.js 的 get() 里读一条迁一条（同样带 unit 标记，幂等）。
+const UNIT_TAG = 'score';                        // 当前单位标记；换单位时改这个值即可再触发一次迁移
+async function migrateUnit(meta, n) {
+  if (!kv.enabled) return false;
+  if (meta.unit === UNIT_TAG) return false;      // 已迁过 → 跳过
+  const K = G.LEGACY_VOTE_TO_SCORE;              // 1000
+  accounts.forEach((a) => {
+    ['total', 'week', 'month', 'round', 'fresh', 'streak'].forEach((f) => {
+      a[f] = Math.round((+a[f] || 0) * K);
+    });
+  });
+  log(`单位迁移 票→分 ×${K}：${n} 人已换算（底池由 pool.js 各自迁）`);
+  return true;
 }
 async function stampMeta() {
   if (!kv.enabled) return;
-  await kv.hset(ACCT_KEY, [META_KEY, JSON.stringify({ wk: weekKey(), mk: monthKey() })]);
+  await kv.hset(ACCT_KEY, [META_KEY, JSON.stringify({ wk: weekKey(), mk: monthKey(), unit: UNIT_TAG })]);
 }
 let _hydrating = null;
 function ready() {

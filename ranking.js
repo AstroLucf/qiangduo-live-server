@@ -122,12 +122,16 @@ const nowSec = () => Math.floor(Date.now() / 1000);
 //
 //  ★丢弃必须打日志：静默截断会让"上报成功"看起来一切正常，实际少报了人。
 const OPEN_ID_RE = /^_[A-Za-z0-9_-]{35}$/;
+// 上报口径 = 账本口径 = 屏幕口径 = 【分】（2026-08-03 起三处统一，见 gifts.js 的 PTS）。
+//   所以这里【不做任何换算】，只过滤不合法 open_id + 兜底取整。
+//   ⚠ 别再加 ×1000：那是"票"时代的遗留，账本已经直接存分了，再乘一次就是 1000 倍虚高。
 function uploadable(list, what) {
   const ok = list.filter((u) => OPEN_ID_RE.test(u.openId));
   const bad = list.filter((u) => !OPEN_ID_RE.test(u.openId));
   if (bad.length) log(`⚠️ ${what}：过滤掉 ${bad.length} 个不合法 open_id（不上报，避免整批被拒）→ ` +
     bad.slice(0, 3).map((u) => u.openId).join(' , ') + (bad.length > 3 ? ' …' : ''));
-  return ok;
+  // 取整是兜底：平台接口只收整数；正常路径下账本本来就是整数（分成/继承那几处已各自 Math.round）
+  return ok.map((u) => ({ ...u, score: Math.round(u.score || 0) }));
 }
 
 // 查某 open_id 的世界榜名次(1-based)；不在榜返回 0。入场视频档位靠它（前百分档播不同视频）。

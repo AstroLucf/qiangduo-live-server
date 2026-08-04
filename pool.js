@@ -52,16 +52,35 @@ function ready() {
 const _boot = setTimeout(hydrate, 800);   // 与 ranking 的 hydrateWorld 同节奏：等 kv 连上再读
 if (_boot.unref) _boot.unref();
 
+// ★单位标记（2026-08-03）：底池随账本一起从「票」改成「分」，存量要 ×1000。
+//   记录里的 `u` 字段就是这个标记 —— 没有 u 的都是旧的票口径，读出来时按需换算一次。
+//   ⚠ 为什么不放在 ledger.hydrate 里一起迁：底池是【按主播 openid】分别存的，
+//     而 ledger.loadPool 要等 /start_game 拿到 anchor 才读，晚于 hydrate。
+//     在 hydrate 里迁只会迁到一个还没载入的 0，随后被读回的旧值原样覆盖。
+//     跟着记录走、读一条迁一条，才不会漏也不会重复。
+const UNIT_TAG = 'score';
+const LEGACY_VOTE_TO_SCORE = 1000;
+function normUnit(v) {
+  if (!v || v.u === UNIT_TAG) return v;
+  return { ...v, p: Math.round((+v.p || 0) * LEGACY_VOTE_TO_SCORE), u: UNIT_TAG };
+}
+
 function get(anchor) {
   const a = norm(anchor);
-  const v = mem.get(a) || mem.get(DEFAULT_ANCHOR) || { p: 0, o: false, t: 0 };
+  const raw = mem.get(a) || mem.get(DEFAULT_ANCHOR) || { p: 0, o: false, t: 0, u: UNIT_TAG };
+  const v = normUnit(raw);
+  if (v !== raw) {                                   // 旧口径 → 就地换算并回写，只发生一次
+    mem.set(a, v);
+    if (kv.enabled) kv.hset(KEY, [a, JSON.stringify(v)]).catch(() => {});
+    log(`底池单位迁移 票→分 ×${LEGACY_VOTE_TO_SCORE}：${a.slice(0, 8)}… → ${v.p}`);
+  }
   return { anchor: a, pool: Math.max(0, Math.round(v.p || 0)), open: !!v.o, at: v.t || 0, ready: hydrated };
 }
 
 // 客户端每局结转后（以及局中低频心跳）推上来。写内存 + 落 Redis，失败不抛。
 async function set(anchor, pool, open) {
   const a = norm(anchor);
-  const v = { p: Math.max(0, Math.round(+pool || 0)), o: !!open, t: Date.now() };
+  const v = { p: Math.max(0, Math.round(+pool || 0)), o: !!open, t: Date.now(), u: UNIT_TAG };
   mem.set(a, v);
   if (kv.enabled) await kv.hset(KEY, [a, JSON.stringify(v)]);
   return get(a);
