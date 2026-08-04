@@ -279,8 +279,15 @@ const server = http.createServer(async (req, res) => {
       }
       // ★入场视频触发（2026-08-01）：放在【记账之后】——首次互动就是送礼的新观众，
       //   要先把这一单计进账本，他才有名次；放前面的话第一次送礼的人永远播不出来。
-      //   身份取 evs[0]（translate 已做 7 嵌套×8 字段名容错），没翻译出事件则回退 dy.userOf。
-      ut.noteInteraction(evs[0] || dy.userOf(item), broadcast, rank.worldRankOf, msgType === 'live_gift');
+      // ★2026-08-04 修「打字也播入场特效（人却没下场）」：
+      //   原来写的是 `evs[0] || dy.userOf(item)` —— 闲聊评论 translate 返回空数组，
+      //   于是回退到 userOf 拿到发言人身份，照样触发入场视频，但他根本没落座、场上没有小火箭。
+      //   现在：translate 没产出事件 = 这条互动不进游戏 = 不该触发任何入场表现，直接跳过。
+      //   连带修好「返回重开后落座没特效、刷礼物才播」——见 userTeam.noteInteraction 的注释。
+      if (evs.length) {
+        const isJoin = evs.some((e) => e.key === 'join');   // 落座（首次互动=正式加入）才是入场视频该播的时刻
+        ut.noteInteraction(evs[0], broadcast, rank.worldRankOf, msgType === 'live_gift', isJoin);
+      }
     }
     broadcast(events);
     pushLedger();

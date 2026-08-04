@@ -70,7 +70,8 @@ function userGroupPush(rawBody, round, broadcast, worldRankOf) {
     broadcast([{ side, key: prev ? 'c666' : 'join', count: 1, switched, from: prev || '', ...user }]);
     // ★入场视频的【第二条】触发路径：小摇杆点选队按钮 = 最明确的"落座"动作。
     //   noteInteraction 与 /cb/* 共用 enteredThisRound，所以「先点按钮后送礼」不会重复播。
-    noteInteraction(user, broadcast, worldRankOf, false);
+    //   isJoin = !prev：没落过座才是"进场"；已落座的人点按钮只是改队，不该再放一次入场视频。
+    noteInteraction(user, broadcast, worldRankOf, false, !prev);
   }
   return {
     errcode: 0, errmsg: 'success',
@@ -134,15 +135,23 @@ const seenThisRound = new Set();              // 本局出现过的 openid（判
 function resetRoundEnter() { enteredThisRound.clear(); seenThisRound.clear(); }
 
 // isGift=true 表示本次互动是送礼（会改变世界榜名次）→ 需要重新查名次。
-function noteInteraction(user, broadcast, worldRankOf, isGift) {
+function noteInteraction(user, broadcast, worldRankOf, isGift, isJoin) {
   const openId = user && (user.openid || user.open_id || user.sec_openid);
   if (!openId || typeof broadcast !== 'function' || typeof worldRankOf !== 'function') return;
   if (enteredThisRound.has(openId)) return;   // 本局已播过 → 后续互动不再触发
   const first = !seenThisRound.has(openId);
   seenThisRound.add(openId);
-  // ★只在【本局首次出现】或【本次是送礼】时才查名次：worldRankOf 每次都要把整张世界榜排序，
-  //   挂在每一条点赞上纯属浪费；而名次只可能因送礼变化。
-  if (!first && !isGift) return;
+  // ★2026-08-04 改判据：由「本局首次出现」改成「本次是落座(join)」。
+  //   旧判据 `!first && !isGift` 的坑（用户报「返回重开后落座没入场特效、刷礼物才播」）：
+  //     first 只表示"这一局第一次见到这个 openid"，而任何一条互动都会把他记进 seenThisRound
+  //     —— 包括闲聊评论（见 index.js 那个已修的 userOf 回退）和点赞。
+  //     于是「先打了句字/点了个赞 → 再扣1落座」的人，落座时 first 已经是 false、又不是送礼，
+  //     直接 return，入场视频不播；等他后来刷了个礼物才被 isGift 放行，特效迟到一大截。
+  //   新判据只认两件事：
+  //     · isJoin —— translate 产出 join 事件 = 观众正式进场，这才是入场视频该播的时刻
+  //     · isGift —— 世界榜按送礼累计，名次可能刚变，要重查（无名次的人送礼后可能就上榜了）
+  //   点赞/666/闲聊一律不查：既不是落座、也不改名次，查了纯属浪费（worldRankOf 要全表排序）。
+  if (!isJoin && !isGift) return;
   const testMode = RANK_ENTER_TEST >= 1 && RANK_ENTER_TEST <= RANK_ENTER_MAX;
   const rank = testMode ? RANK_ENTER_TEST : worldRankOf(openId);
   const now = Date.now();
