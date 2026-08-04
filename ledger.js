@@ -158,22 +158,24 @@ function record(ev) {
   if (!id) return 0;                                // 匿名互动无法归属到人，不进账本（客户端同理只做视觉）
   const unit = G.ptsOf(ev.key);
   if (!unit) return 0;
-  // ★count 只对【免费互动】生效（2026-08-04）：
-  //   · 点赞：douyin.js 按平台报的 like_num 下发 count，而 gifts.js 的设计口径是
-  //     「100 次点赞 = 一根仙女棒」—— 不按次数记，观众点一万下也只算一次，那条口径直接不成立。
-  //   · 付费礼物：连击(gift_num)【维持只记一次】，这是既有的防灌爆奖励池决策，别顺手改掉；
-  //     要改是产品口径变更，得单独拍板。
+  // ★count 一律生效，付费礼物也不例外（2026-08-04 用户定：「付费礼物计分一定不能落下」）：
+  //   · 点赞：douyin.js 按平台报的 like_num 下发 count；gifts.js 的口径是「100 次点赞 = 一根仙女棒」，
+  //     不按次数记这条口径直接不成立。
+  //   · 付费礼物连击(gift_num)：观众送 5 连击甜甜圈是【真花了 5 份钱】，只记 1 份就是少记。
+  //     ⚠ 原先"连击只记一次"是防灌爆奖励池的老决策，已被推翻 —— 别再改回去。
+  //     防灌爆改由上游把关：douyin.js 的 clampInt(gift_num,1,20) + 下面这道 30 的兜底。
   //   ⚠ 本函数此前完全无视 count（只在 [push] 日志里打出来），douyin.js 那边却按"多出来的会进积分"
-  //     写了注释 —— 两边对不上。现在以本函数为准。
-  const n = G.isPaid(ev.key) ? 1 : Math.max(1, Math.min(parseInt(ev.count, 10) || 1, 30));
+  //     写了注释 —— 两边对不上过一轮。现在以本函数为准。
+  const n = Math.max(1, Math.min(parseInt(ev.count, 10) || 1, 30));
   const pts = unit * n;
   const a = acct(id);
   if (ev.nickname) a.name = ev.nickname;            // 昵称/头像以最新一次为准
   if (ev.avatar) a.avatar = ev.avatar;
   if (!a.side && (ev.side === 'left' || ev.side === 'right')) a.side = ev.side;   // 落座锁：本局第一次定了就不改
   a.fresh += pts; a.round += pts; a.week += pts; a.month += pts; a.total += pts;
-  // 计数也按真实次数走：全员分成资格是「点赞 > LIKE_QUALIFY(50)」，只 +1 的话这条门槛几乎摸不到
-  if (G.isPaid(ev.key)) a.gifts += 1; else a.likes += n;
+  // 计数也按真实次数走：全员分成资格是「刷过礼物 或 点赞 > LIKE_QUALIFY(50)」，
+  // 只 +1 的话点赞那条门槛几乎摸不到；礼物笔数同理，5 连击就是 5 笔。
+  if (G.isPaid(ev.key)) a.gifts += n; else a.likes += n;
   roundPool += pts;
   poolOpen = true;
   markDirty(id);
