@@ -109,7 +109,11 @@ async function hydrate() {
   hydrated = true;
   log(`账本已从持久化恢复 ${n} 人` + (wReset ? ' · 周榜已重置' : '') + (mReset ? ' · 月榜/连胜已重置' : ''));
   const migrated = await migrateUnit(meta, n);    // 票 → 分（只跑一次，见下）
-  if (wReset || mReset || migrated) { accounts.forEach((_, id) => _dirty.add(id)); await stampMeta(); await flush(); }
+  // ⚠ 顺序不能反：必须【先 flush 落盘、后 stampMeta 打标记】。
+  //   反过来的话，一旦 flush 失败（Redis 抖动/超时），META 已经写着 unit:'score'，
+  //   而账本数据还是旧口径 —— 下次启动看到标记就跳过迁移，那批数据【永远】停在票口径，
+  //   而且再没有任何机会补救。先落盘再打标记：flush 失败就不打标记，下次启动重试。
+  if (wReset || mReset || migrated) { accounts.forEach((_, id) => _dirty.add(id)); await flush(); await stampMeta(); }
   else await stampMeta();
 }
 // ★存量单位迁移：票 → 分（2026-08-03 一次性）★

@@ -27,6 +27,20 @@ let hydrated = false;
 function log(...a) { console.log('[pool]', ...a); }
 const norm = (a) => String(a || '').trim() || DEFAULT_ANCHOR;
 
+// ★单位标记（2026-08-03）：底池随账本一起从「票」改成「分」，存量要 ×1000。
+//   记录里的 `u` 字段就是这个标记；没有 u 的都是旧的票口径。
+//   迁移在 hydrate() 里【开机一次性做完】并写回 Redis，不走懒迁 ——
+//   懒迁会让 diag()/健康检查读到未换算的原值，跟游戏实际用的值对不上。
+//   normUnit 仍留在 get() 里当兜底：滚动发布期间可能有旧实例写进新记录。
+//   ⚠ 幂等全靠 u 字段，而 u 必须在 hydrate 解析时原样带进内存 —— 漏掉它，
+//     每次重启都会再迁一次，底池会 ×1000 地涨。
+const UNIT_TAG = 'score';
+const LEGACY_VOTE_TO_SCORE = 1000;
+function normUnit(v) {
+  if (!v || v.u === UNIT_TAG) return v;
+  return { ...v, p: Math.round((+v.p || 0) * LEGACY_VOTE_TO_SCORE), u: UNIT_TAG };
+}
+
 // 启动时把整张表读回内存：GET /pool 要同步返回，不能每次都等一趟 Redis 往返。
 async function hydrate() {
   if (!kv.enabled) { hydrated = true; return; }
@@ -35,11 +49,30 @@ async function hydrate() {
   //   客户端信了就把主播攒了很多局的底池当成 0 覆盖掉 —— 这是最贵的一种错。
   if (!h) { log('底池读取失败（Redis 未就绪？）→ 保持 ready:false，客户端会退回本机缓存'); return; }
   let n = 0;
+  const migrated = [];
   for (const a in h) {
-    try { const v = JSON.parse(h[a]); mem.set(a, { p: +v.p || 0, o: !!v.o, t: v.t || 0 }); n++; } catch (_) {}
+    try {
+      const v = JSON.parse(h[a]);
+      // ⚠ u（单位标记）必须原样带进内存 —— 漏掉它，下次重启会把已经迁过的记录当成旧的【再迁一次】，
+      //   底池每重启一次 ×1000。这条是 2026-08-03 实测抓到的，别再改回只取 p/o/t。
+      const rec = normUnit({ p: +v.p || 0, o: !!v.o, t: v.t || 0, u: v.u });
+      mem.set(a, rec); n++;
+      if (rec.u !== v.u) migrated.push(a);            // 本次刚换算的，要写回 Redis
+    } catch (_) {}
   }
   hydrated = true;
   log(`底池已从持久化恢复 ${n} 位主播` + (n ? '：' + [...mem.entries()].map(([a, v]) => a.slice(0, 8) + '…=' + v.p).join(' ') : ''));
+  // ★开机就把存量单位迁完（票→分 ×1000），而不是等 get() 懒迁：
+  //   懒迁会让 diag()/健康检查读到未换算的原值，跟游戏实际用的值对不上 —— 诊断口说谎比 bug 本身更贵。
+  if (migrated.length && kv.enabled) {
+    const pairs = [];
+    migrated.forEach((a) => pairs.push(a, JSON.stringify(mem.get(a))));
+    try {
+      await kv.hset(KEY, pairs);
+      log(`底池单位迁移 票→分 ×${LEGACY_VOTE_TO_SCORE} 完成 ${migrated.length} 位：` +
+        migrated.map((a) => a.slice(0, 8) + '…=' + mem.get(a).p).join(' '));
+    } catch (e) { log('⚠️ 底池单位迁移写回失败，下次启动会重试：' + e.message); }
+  }
 }
 // 客户端开局第一件事就是 GET /pool，很可能【早于】下面那次延迟 hydrate。
 // ready() 保证：没读回来之前先读一次（并发只走一趟），读不到就如实报 ready:false。
@@ -51,19 +84,6 @@ function ready() {
 }
 const _boot = setTimeout(hydrate, 800);   // 与 ranking 的 hydrateWorld 同节奏：等 kv 连上再读
 if (_boot.unref) _boot.unref();
-
-// ★单位标记（2026-08-03）：底池随账本一起从「票」改成「分」，存量要 ×1000。
-//   记录里的 `u` 字段就是这个标记 —— 没有 u 的都是旧的票口径，读出来时按需换算一次。
-//   ⚠ 为什么不放在 ledger.hydrate 里一起迁：底池是【按主播 openid】分别存的，
-//     而 ledger.loadPool 要等 /start_game 拿到 anchor 才读，晚于 hydrate。
-//     在 hydrate 里迁只会迁到一个还没载入的 0，随后被读回的旧值原样覆盖。
-//     跟着记录走、读一条迁一条，才不会漏也不会重复。
-const UNIT_TAG = 'score';
-const LEGACY_VOTE_TO_SCORE = 1000;
-function normUnit(v) {
-  if (!v || v.u === UNIT_TAG) return v;
-  return { ...v, p: Math.round((+v.p || 0) * LEGACY_VOTE_TO_SCORE), u: UNIT_TAG };
-}
 
 function get(anchor) {
   const a = norm(anchor);
@@ -94,6 +114,11 @@ async function reset(prefix) {
   return { removed: hit.length, anchors: hit };
 }
 
-function diag() { return { anchors: mem.size, hydrated, kv: kv.enabled, list: [...mem.entries()].map(([a, v]) => ({ anchor: a, pool: v.p, open: v.o })) }; }
+// ⚠ 报的必须是【游戏实际会用到的值】：过一遍 normUnit，否则诊断口显示的是未换算的原值，
+//   跟 get() 返回的对不上 —— 2026-08-03 就差点照着它误判「迁移没生效」。
+function diag() {
+  return { anchors: mem.size, hydrated, kv: kv.enabled, unit: UNIT_TAG,
+    list: [...mem.entries()].map(([a, v]) => { const n = normUnit(v); return { anchor: a, pool: n.p, open: n.o, migrated: n !== v }; }) };
+}
 
 module.exports = { get, set, reset, diag, hydrate, ready };
