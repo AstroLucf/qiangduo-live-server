@@ -156,14 +156,24 @@ function record(ev) {
   if (!roundActive) return 0;                       // 主播还没点开始 → 客户端也丢弃，两边一致
   const id = ev && ev.openid;
   if (!id) return 0;                                // 匿名互动无法归属到人，不进账本（客户端同理只做视觉）
-  const pts = G.ptsOf(ev.key);
-  if (!pts) return 0;
+  const unit = G.ptsOf(ev.key);
+  if (!unit) return 0;
+  // ★count 只对【免费互动】生效（2026-08-04）：
+  //   · 点赞：douyin.js 按平台报的 like_num 下发 count，而 gifts.js 的设计口径是
+  //     「100 次点赞 = 一根仙女棒」—— 不按次数记，观众点一万下也只算一次，那条口径直接不成立。
+  //   · 付费礼物：连击(gift_num)【维持只记一次】，这是既有的防灌爆奖励池决策，别顺手改掉；
+  //     要改是产品口径变更，得单独拍板。
+  //   ⚠ 本函数此前完全无视 count（只在 [push] 日志里打出来），douyin.js 那边却按"多出来的会进积分"
+  //     写了注释 —— 两边对不上。现在以本函数为准。
+  const n = G.isPaid(ev.key) ? 1 : Math.max(1, Math.min(parseInt(ev.count, 10) || 1, 30));
+  const pts = unit * n;
   const a = acct(id);
   if (ev.nickname) a.name = ev.nickname;            // 昵称/头像以最新一次为准
   if (ev.avatar) a.avatar = ev.avatar;
   if (!a.side && (ev.side === 'left' || ev.side === 'right')) a.side = ev.side;   // 落座锁：本局第一次定了就不改
   a.fresh += pts; a.round += pts; a.week += pts; a.month += pts; a.total += pts;
-  if (G.isPaid(ev.key)) a.gifts += 1; else a.likes += 1;
+  // 计数也按真实次数走：全员分成资格是「点赞 > LIKE_QUALIFY(50)」，只 +1 的话这条门槛几乎摸不到
+  if (G.isPaid(ev.key)) a.gifts += 1; else a.likes += n;
   roundPool += pts;
   poolOpen = true;
   markDirty(id);

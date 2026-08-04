@@ -205,11 +205,21 @@ function translate(msgType, payload, defaultSide) {
       // 首次互动=正式加入(join 永久推力+入场小火箭)，再叠加本次礼物特效；之后只发礼物
       return first ? [{ side, key: 'join', count: 1, ...u }, giftEv] : [giftEv];
     }
-    case 'live_like': {                                     // 点赞=氛围，不按 like_num 放大（且低概率丢包）
+    case 'live_like': {
       const first = !chosenSide(u.openid);
       const side = lockSide(u.openid, defaultSide);          // 首次→落座并锁;已落座→归原队
       if (side !== 'left' && side !== 'right') return [];
-      return [{ side, key: first ? 'join' : 'like', count: 1, ...u }];  // 首次=正式加入(join);之后=点赞氛围
+      if (first) return [{ side, key: 'join', count: 1, ...u }];        // 首次互动=正式加入(join·永久推力+入场小火箭)
+      // ★2026-08-04 起按【真实点赞数】下发（原来无条件 count:1，把平台报的 like_num 整个丢掉了）。
+      //   客户端已改成「屏幕容量固定 + 0.5s 环形桶配额」渲染：来 10 个还是 1000 个，
+      //   同屏恒定 LIKE.cap 个、流速恒定 —— 所以放开数量【不会】变成更多 DOM/解码器。
+      //   ⚠ 光改这里不够：ledger.record() 原本【完全无视 count】，只在 [push] 日志里打出来，
+      //     所以 count=30 和 count=1 记的分一模一样。2026-08-04 已同步改 record()
+      //     按 count 计分（仅免费互动；付费礼物连击维持只记一次）。改动量要两边一起看。
+      //   上限 30 是防单次回调异常值，不是防刷屏；客户端 liveBridge 视觉回放另有 20 的上限，
+      //   两者不必相等 —— 积分以服务端为准，回放上限只影响推力/特效。
+      const n = clampInt(payload.like_num, 1, 30);
+      return [{ side, key: 'like', count: n, ...u }];
     }
     case 'live_comment': {
       const intent = commentIntent(commentText(payload));
