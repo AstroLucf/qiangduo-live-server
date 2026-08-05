@@ -302,6 +302,9 @@ async function loadPool(room, anchorOpenId) {
 // ── 给客户端的快照 ──
 // 只送用得上的人：本局参与者（fresh>0 或已落座）+ 总榜前 SNAP_TOP，避免观众上万时把 SSE 撑爆。
 const SNAP_TOP = 150;
+// 四榜(总/周/月/连胜)各取前 SNAP_TOP 后的并集大小警戒线：超了只打日志、不截断 ——
+// 静默截断会让某个榜的尾部凭空少人，比体积大更难查。
+const UNION_CAP = 300;
 // 下发给【这个房间】的快照：本房参战者（局内分）+ 总榜前 N（跨房分，给世界榜 tab 用）
 function snapshot(room) {
   const seen = new Set(), list = [];
@@ -314,8 +317,22 @@ function snapshot(room) {
                 likes: l ? l.likes : 0, gifts: l ? l.gifts : 0, side: l ? l.side : null });
   };
   room.local.forEach((l, id) => { if (l.fresh > 0 || l.side) put(id, l); });   // 本房参战者优先
-  [...accounts.values()].sort((x, y) => y.total - x.total).slice(0, SNAP_TOP)
-    .forEach((a) => put(a.openid, room.local.get(a.openid)));                  // 再补总榜前 N
+  // ★四个榜各补各的前 N（2026-08-05 修「周榜月榜和本局榜单积分不同步」）★
+  //   原来只补【总榜前 SNAP_TOP】，而客户端有四个 tab：本局/周榜/月榜/连胜榜，
+  //   它们都只能在这份名单里排序 —— 于是「本周刷了很多、但历史总积分排 150 名开外」的观众
+  //   在周榜上【一行都不出现】，客户端那个周榜其实是「总榜前 150 这个子集内按周分排序」。
+  //   而只要他在本房互动一次又会突然冒出来 → 同一个人在开打前/开打后是两份周榜。
+  //   ⚠ 四个指标的头部通常高度重叠（大 R 各榜都在前面），并集远小于 4×；
+  //     真实体积打进日志（下面 UNION_CAP），别静默膨胀也别静默截断。
+  const fill = (metric) => [...accounts.values()]
+    .filter((a) => a[metric] > 0)
+    .sort((x, y) => y[metric] - x[metric])
+    .slice(0, SNAP_TOP)
+    .forEach((a) => put(a.openid, room.local.get(a.openid)));
+  ['total', 'week', 'month', 'streak'].forEach(fill);
+  if (list.length > UNION_CAP) {
+    log(`⚠️ 快照名单 ${list.length} 人（>${UNION_CAP}）—— 四榜并集偏大，SSE 体积需要关注`);
+  }
   return { type: 'ledger', ready: hydrated, pool: room.pool, poolOpen: room.poolOpen, active: room.active, users: list };
 }
 // ── 只读排行（ranking.js 上报给抖音平台时读这里，不再自己攒一本账）──
