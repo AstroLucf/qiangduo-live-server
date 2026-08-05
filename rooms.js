@@ -71,6 +71,12 @@ function blank(anchor) {
     entered: new Set(),                // 本局已播过入场视频的 openId
     seen: new Set(),                   // 本局出现过的 openId（判首次）
     cooldown: new Map(),               // openId -> ts  入场视频跨局去抖
+    // ── 加入粉丝团（2026-08-05）──
+    // ★这两个【不随 clearRound 清】★ 语义是「这个主播这一场直播里，每人只播一次」，
+    //   和同一个函数里被清的 side/entered/seen 行为相反 —— 清了就等于每开一局能再刷一次。
+    //   跟着房间(主播 openid)走，所以观众在 A 主播房领过，去 B 主播房加 B 的团照样会播。
+    fansSeen: new Set(),               // 本场已播过加团表现的 openId
+    fansPending: new Map(),            // 加团时还没下场的人 openId -> user，等他落座再补发
     rankSnap: null,                    // 入场视频名次【按局冻结】快照 openId->名次：settle 时刷新，供【下一局】进场查档（不实时）
     local: new Map(),                  // openId -> {fresh, round, likes, gifts, side}  局内账
     lastSeen: Date.now(),
@@ -123,6 +129,8 @@ function local(r, openId) {
 function clearRound(r) {                 // 开新局：清局内，不动积分池（底池要留）
   r.local.forEach((u) => { u.fresh = 0; u.likes = 0; u.gifts = 0; u.side = null; });
   r.side.clear(); r.entered.clear(); r.seen.clear();
+  // ⚠ 故意不清 fansSeen / fansPending：加团是「一场直播一次」，不是「一局一次」。
+  //   清了的话主播开一局观众就能再看一次表现，门禁形同虚设（退团重加要再花钱，但表现不该重复）。
 }
 
 // ── SSE ──

@@ -193,7 +193,9 @@ function json(res, code, obj) { cors(res); res.writeHead(code, { 'Content-Type':
 function readBody(req) { return new Promise((r) => { let b = ''; req.on('data', (c) => (b += c)); req.on('end', () => r(b)); }); }
 
 // 回调路由 → msg_type_str
-// 粉丝团[必接]：经典-角力品类要求绑定回调，但本游戏不消费粉丝团数据 →
+// 粉丝团[已消费·2026-08-05]：加团(fansclub_reason_type=2) → 一条甜甜圈级别的纯视觉表现。
+// 原注释说「本游戏不消费粉丝团数据、登记进来只为 200 ack」已过时，见 douyin.js 的 live_fansclub 分支。
+// 旧注释保留在下面作为历史：
 // 登记进来只为让 /cb/fansclub 被 200 ack（translate 命中 default 返回 []，无游戏效果），避免 404。
 const MSGTYPE = { gift: 'live_gift', like: 'live_like', comment: 'live_comment', team: 'team_select', fansclub: 'live_fansclub' };
 
@@ -317,7 +319,7 @@ const server = http.createServer(async (req, res) => {
     if (roomId) room.roomId = roomId;
     let events = [];
     for (const item of items) {
-      const evs = dy.translate(msgType, item, cfg.DEFAULT_SIDE, room.side);
+      const evs = dy.translate(msgType, item, cfg.DEFAULT_SIDE, room.side, { seen: room.fansSeen, pending: room.fansPending, active: room.active });
       // 诊断：(空!)=该字段没取到
       if (evs[0]) console.log(`[cb→] side=${evs[0].side} key=${evs[0].key} openid=${evs[0].openid || '(空!)'} avatar=${evs[0].avatar ? '有' : '(空!)'} nick=${evs[0].nickname || '(空)'}`);
       else console.log(`[cb→] ${msgType} → 0 事件（未选队 / 字段取空被丢弃）`);

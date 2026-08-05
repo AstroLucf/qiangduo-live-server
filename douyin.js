@@ -107,6 +107,39 @@ function lockSide(openid, prefer, explicit, sides) {
 // ⚠ 只清【传进来的那一份】：不传才清兜底表。多房时清 A 房绝不能碰 B 房。
 function clearSides(sides) { M(sides).clear(); }
 
+// ── 加入粉丝团（2026-08-05）──────────────────────────────────────────
+// 为什么做粉丝团而不是「关注」：关注事件我们【拿不到】——task/start 的 msg_type 是封闭四值
+// (live_comment/live_gift/live_like/live_fansclub)，服务端 OpenAPI 没有关注查询，
+// 我们的 Electron exe 也没有 tt.* runtime；而且《直播小玩法基础规范》「滥用关注行为」第2类
+// （诱导关注后无需更深度操作即获虚拟奖品）是四级违规。粉丝团是平台唯一给了设计规范的同类能力。
+// 门禁天然更强：推送里【没有退团事件】，退团花的灯牌钱不退、重加要再花一次。
+const fansSeenFallback = new Set();      // 不传 fans 时的兜底（本地调试/自查工具/老调用）
+const fansPendFallback = new Map();
+const FSEEN = (f) => (f && f.seen instanceof Set ? f.seen : fansSeenFallback);
+const FPEND = (f) => (f && f.pending instanceof Map ? f.pending : fansPendFallback);
+// 对局是否进行中。★缺省 true★：不传 fans 的老调用/本地调试/自查工具行为不变。
+const FACTIVE = (f) => (f && 'active' in f ? !!f.active : true);
+const FANS_PENDING_MAX = 50;             // 挂起上限：防异常刷量把内存撑大
+
+// 产出一条加团表现，并【消耗掉】他这一场的唯一名额。已发过 → null。
+function fanJoinEv(u, side, fans) {
+  const seen = FSEEN(fans);
+  if (!u.openid || seen.has(u.openid)) return null;
+  seen.add(u.openid);
+  return { side, key: 'fanjoin', count: 1, ...u };
+}
+// 他加团时还没下场 → 当时挂起了一条；现在他落座了，把那条补上。
+// ★挂在「产出 join 的那几个分支」上，而不是在 index.js 里做：/cb/* 和内网专线
+//   liveDataCallback 是两条注入路，写在 translate 里两条都覆盖（震动特效那次就是只改了一条）。
+function flushPendingFan(evs, u, side, fans) {
+  if (!FACTIVE(fans)) return evs;          // 还没开局 / 正在结算 → 继续挂着，别在客户端会丢弃的时刻发
+  const pend = FPEND(fans);
+  if (!u.openid || !pend.has(u.openid)) return evs;
+  pend.delete(u.openid);
+  const ev = fanJoinEv(u, side, fans);
+  return ev ? evs.concat([ev]) : evs;
+}
+
 // —— 验签 ——（占位：标准 HMAC 结构；具体拼接顺序/算法用控制台「签名调试工具」校准后定稿）
 function verifySign(headers, rawBody, appSecret) {
   const sig = headers['x-signature'];
@@ -203,7 +236,7 @@ function sideFromTeam(payload) {
 // msgType 取 msg_type_str（live_gift / live_like / live_comment）；选队类型字符串待官方确认，
 // 这里用内部约定 'team_select'，由回调路由 /cb/team 映射进来。
 // ★sides = 该直播间自己的落座表（rooms.js 的 room.side）。不传 → 用模块级兜底表（本地/自查工具/老包）。
-function translate(msgType, payload, defaultSide, sides) {
+function translate(msgType, payload, defaultSide, sides, fans) {
   const u = userOf(payload);
   switch (msgType) {
     case 'live_gift': {
@@ -214,7 +247,8 @@ function translate(msgType, payload, defaultSide, sides) {
       const count = clampInt(payload.gift_num, 1, 20);     // 连击上限 20，防刷屏
       const giftEv = { side, key, count, ...u };
       // 首次互动=正式加入(join 永久推力+入场小火箭)，再叠加本次礼物特效；之后只发礼物
-      return first ? [{ side, key: 'join', count: 1, ...u }, giftEv] : [giftEv];
+      const evs = first ? [{ side, key: 'join', count: 1, ...u }, giftEv] : [giftEv];
+      return first ? flushPendingFan(evs, u, side, fans) : evs;   // 之前加过团但没下场 → 现在补发
     }
     case 'live_like': {
       // ★2026-08-05 用户定：点赞【不再下场】★
@@ -241,7 +275,8 @@ function translate(msgType, payload, defaultSide, sides) {
         const prev = chosenSide(u.openid, sides);             // 改队前在哪边（''=没落座过）
         const side = lockSide(u.openid, intent, true, sides); // explicit=true → 观众说了算
         const switched = !!prev && prev !== side;             // 真的换边了 → 让客户端把他的小火箭挪过去
-        return [{ side, key: prev ? 'c666' : 'join', count: 1, switched, from: prev || '', ...u }];
+        const evs = [{ side, key: prev ? 'c666' : 'join', count: 1, switched, from: prev || '', ...u }];
+        return prev ? evs : flushPendingFan(evs, u, side, fans);   // 首次落座 → 补发挂起的加团表现
       }
       if (intent === 'cheer') {
         // ★2026-08-05 用户定：除 1/2 以外的弹幕【一律不下场】★（666/6/66 同点赞处理）
@@ -253,13 +288,42 @@ function translate(msgType, payload, defaultSide, sides) {
       }
       return [];                                             // 其余评论(闲聊)→ 不落座、不下发
     }
+    // ★加入粉丝团 → 一条甜甜圈级别的【纯视觉】表现（零积分、零推力、不进积分池）★
+    case 'live_fansclub': {
+      // L0 只认加团。fansclub_reason_type：1=升级、2=加团。
+      //   ⚠ 升级可以【反复发生】（等级能一直升），接了它就等于自己开了一条无限发放通道。
+      //     字段取不到也丢 —— 宁可不播，也绝不能把升级当加团。真机字段名以 [cb] raw 日志为准。
+      const reason = Number(payload.fansclub_reason_type ?? payload.reason_type ?? payload.fansclubReasonType);
+      if (reason !== 2) return [];
+      // L1 无身份无法门禁，直接丢（同 ledger.record 对匿名的处理）
+      if (!u.openid) return [];
+      // L3 一人一场只发一次。★先判重再判别的★——平台明说 msg_id 可能重复推、fail_data 回查
+      //    还会重放，那些重复的 openid 一定已经在 fansSeen 里，openid 级门禁天然全吞掉，
+      //    不需要再建一张 msg_id 表。
+      if (FSEEN(fans).has(u.openid)) return [];
+      // L2 只读落座表定边，【绝不 lockSide】：加团不是选队表态，写落座表等于把人拽下场，
+      //    与 2026-08-05 定的「点赞/666 不下场」同一条纪律。
+      const side = chosenSide(u.openid, sides);
+      // 两种情况都先挂起、★不消耗名额★，等他（下一局）首次落座时由 flushPendingFan 补发：
+      //   ① 还没下场 —— 没有队，甜甜圈横幅不知道该出在哪一边；
+      //   ② 主播还没点开始 / 正在结算 —— 客户端此时会整体丢弃视觉（liveBridge 开局门控 +
+      //      main.js 的 roundLive 门禁），这会儿发了他一眼都看不到，名额却白白烧掉。
+      if (!FACTIVE(fans) || (side !== 'left' && side !== 'right')) {
+        const pend = FPEND(fans);
+        if (pend.size < FANS_PENDING_MAX) pend.set(u.openid, u);
+        return [];
+      }
+      const ev = fanJoinEv(u, side, fans);
+      return ev ? [ev] : [];
+    }
     case 'team_select': {                                   // 原生选队 = 显式意愿：首次落座 / 已落座也允许改队
       const raw = sideFromTeam(payload);
       if (!raw) return [];
       const prev = chosenSide(u.openid, sides);
       const side = lockSide(u.openid, raw, true, sides);    // explicit=true，同评论 1/2
       const switched = !!prev && prev !== side;
-      return [{ side, key: prev ? 'c666' : 'join', count: 1, switched, from: prev || '', ...u }];
+      const evs = [{ side, key: prev ? 'c666' : 'join', count: 1, switched, from: prev || '', ...u }];
+      return prev ? evs : flushPendingFan(evs, u, side, fans);
     }
     default: return [];
   }
