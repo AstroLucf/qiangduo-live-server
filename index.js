@@ -481,7 +481,18 @@ const server = http.createServer(async (req, res) => {
     let body = {}; try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
     if (body.pool == null) return json(res, 400, { ok: false, err: 'pool required' });
     const _room = roomOf(u, req, body);
-    const r = await pool.set(_room.anchor, body.pool, body.open, _room.local);
+    // ★客户端不许凭空把 open 置真（2026-08-05 修「底池平白少 60%」）★
+    //   open=true 的含义是「这一局开打了但还没结转」，下次 /round/start 会据此补一次 40% 折。
+    //   而客户端的 roundOpen 只要 Score.onSupport 跑过一次就变真 —— 主播还没点「开始」的封面上、
+    //   以及 KO 之后的结算窗口里，互动照样会走到 onSupport（WS 回放路没有开局门控），
+    //   于是把 open:true 推上来。存档里上一局本已 open:false（正常结转过），被改回 true 后
+    //   下一次开局就【多折一次】：实测存档 200000 → 开局后 room.pool 变成 80000，少了 60%。
+    //   服务端自己知道这一局有没有记过账（room.poolOpen 由 ledger.record 置真），以它为准：
+    //   · 服务端记过 → 主播确实打过这一局（含"结算面板开着就关 exe"）→ 尊重客户端的 open:true
+    //   · 服务端一笔没记 → 池子根本没涨，不需要折，客户端说什么都不算
+    const _open = !!body.open && !!_room.poolOpen;
+    const r = await pool.set(_room.anchor, body.pool, _open, _room.local);
+    if (body.open && !_open) console.log(`[pool] 忽略客户端的 open:true（服务端本局未记过账）· anchor=${_room.anchor.slice(0, 10)}…`);
     console.log(`[pool] 存档 anchor=${r.anchor.slice(0, 10)}… pool=${r.pool} open=${r.open}`);
     return json(res, 200, { ok: true, ...r });
   }
