@@ -174,7 +174,14 @@ function record(room, ev) {
   const l = R.local(room, id);                      // 本房局内账
   if (ev.nickname) a.name = ev.nickname;            // 昵称/头像以最新一次为准
   if (ev.avatar) a.avatar = ev.avatar;
-  if (!l.side && (ev.side === 'left' || ev.side === 'right')) l.side = ev.side;   // 落座锁：本局第一次定了就不改
+  // ★阵容【跟着最新一条事件走】，不在这里再锁一次（2026-08-05 修）★
+  //   原来是 `if (!l.side)` —— 本局第一次定了就不改。那是 2026-08-03「显式意愿可改队」之前的口径，
+  //   改了之后就成了错的：观众先送礼被随机落座到 2、再扣「1」明确改到 1 队，
+  //   douyin.js 的落座表、客户端的火箭/推力/仙女棒【全都】搬到了 1 队，只有这本账还记着 2 ——
+  //   于是结算时他被当成 2 队的人分钱（1 队赢了他拿败方待遇）。这是钱算错，不是显示错。
+  //   ⚠ 落座锁的真源只有一处：douyin.js 的 lockSide（隐式落座锁死本局、显式意愿允许改队）。
+  //     ev.side 已经是它的输出，这里再锁一遍就是两套口径打架。别再加回 !l.side。
+  if (ev.side === 'left' || ev.side === 'right') l.side = ev.side;
   l.fresh += pts; l.round += pts;                   // ← 本房本局
   a.week += pts; a.month += pts; a.total += pts;    // ← 跨房累计
   // 计数也按真实次数走：全员分成资格是「刷过礼物 或 点赞 > LIKE_QUALIFY(50)」，

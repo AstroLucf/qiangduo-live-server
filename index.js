@@ -101,8 +101,14 @@ logln('就绪 — 点按钮，看游戏标签实时反应（同名观众重复�
 function broadcast(room, events) {
   if (!room) throw new Error('broadcast 必须指定 room（防止误发给所有直播间）');
   if (!events || !events.length) return;
-  // 用户快捷选队②:观众加入阵营(首次落座=join)时上报阵营给平台。评论/礼物/小摇杆选队 各入口统一在此上报。
-  for (const e of events) { if (e.key === 'join' && e.openid && (e.side === 'left' || e.side === 'right')) rank.uploadUserGroup(e.openid, e.side, room.roomId); }
+  // 用户快捷选队②:观众加入阵营时上报阵营给平台。评论/礼物/小摇杆选队 各入口统一在此上报。
+  // ★换队(switched)也必须补报（2026-08-05 修）：原来只认 key==='join'，
+  //   而观众改队时 douyin.js 下发的是 c666+switched:true，不是 join —— 于是平台侧的阵容
+  //   永远停在他最初落座的那一队，观众在小摇杆里看到的自己阵营和场上表现对不上。
+  for (const e of events) {
+    if (!e.openid || (e.side !== 'left' && e.side !== 'right')) continue;
+    if (e.key === 'join' || e.switched) rank.uploadUserGroup(e.openid, e.side, room.roomId);
+  }
   const n = rooms.push(room, events);
   console.log(`[push] ${room.anchor.slice(0, 8)}#${room.eventSeq} ${events.map((e) => (e.type ? `${e.type}(${e.users ? e.users.length + '人·池' + e.pool : ''})` : `${e.side}:${e.key}×${e.count}`)).join('  ')}  → ${n} 端`);
 }
