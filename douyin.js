@@ -48,15 +48,22 @@ function giftToKey({ sec_gift_id, diamond }) {
 }
 
 // —— 选边：记住每个用户选了哪队 ——（用户快捷选队能力的数据写这里）
-const userSide = new Map();                   // sec_openid -> 'left' | 'right'
-function setSide(openid, side) {
-  if (openid && (side === 'left' || side === 'right')) userSide.set(openid, side);
+// ★2026-08-05 多直播间隔离：落座表改成【由调用方注入】。
+//   原来是模块级单份 Map —— 几个直播间同开时，观众在 A 房站左边，进 B 房还是左边，
+//   而且 A 房 clearSides() 会把 B 房的落座一起清掉。
+//   现在每个房间自带一份（见 rooms.js 的 room.side），调用时作为最后一个参数传进来。
+//   ⚠ 不传 = 退回下面这份模块级兜底表：本地调试、自查工具、老版本 exe 都走它，
+//     行为与改造前完全一致，所以这次改造对它们零影响。
+const userSide = new Map();                   // sec_openid -> 'left' | 'right'（兜底表）
+const M = (sides) => (sides instanceof Map ? sides : userSide);
+function setSide(openid, side, sides) {
+  if (openid && (side === 'left' || side === 'right')) M(sides).set(openid, side);
 }
 // 查该用户【主动选过】的队(评论1/2 · 原生选队)；没选过返回 ''(纯探测,绝不触发随机落座)
-function chosenSide(openid) { return (openid && userSide.get(openid)) || ''; }
+function chosenSide(openid, sides) { return (openid && M(sides).get(openid)) || ''; }
 // 给一次互动定边：主动选过 → 那边；否则 DEFAULT_SIDE 指定 left/right → 固定；否则「随机落座」(哈希,没选队也参与、不丢弃)
-function sideOf(openid, fallback) {
-  const chosen = chosenSide(openid);
+function sideOf(openid, fallback, sides) {
+  const chosen = chosenSide(openid, sides);
   if (chosen) return chosen;
   if (fallback === 'left' || fallback === 'right') return fallback;
   return hashSide(openid);
@@ -84,18 +91,19 @@ function randSide() { return Math.random() < 0.5 ? 'right' : 'left'; }
 //     · 显式意愿（评论1/2 · 原生选队 · 小摇杆选队）→ 允许改队，观众说了算
 //   ⚠ explicit 只能由「观众主动指定阵营」的入口传 true。礼物/点赞传的是 DEFAULT_SIDE，
 //     那不是意愿、是兜底，绝不能当显式——否则 DEFAULT_SIDE 一配就把所有人反复拽到同一边。
-function lockSide(openid, prefer, explicit) {
-  const chosen = chosenSide(openid);
+function lockSide(openid, prefer, explicit, sides) {
+  const chosen = chosenSide(openid, sides);
   const wants = (prefer === 'left' || prefer === 'right');
   if (chosen && !(explicit && wants)) return chosen;           // 已落座且非显式改队 → 归原队
   const side = (prefer === 'left' || prefer === 'right')
     ? prefer                                                  // 评论1/2/原生选队：按方向落座
     : (openid ? hashSide(openid) : randSide());               // 礼物/点赞/666：有身份哈希随机、匿名当次随机
-  if (openid) setSide(openid, side);                          // 有身份才能锁(匿名无法追踪到人)
+  if (openid) setSide(openid, side, sides);                   // 有身份才能锁(匿名无法追踪到人)
   return side;
 }
 // 开局清空落座记录 —— 配合「每局重新拉队」：上一局的落座不跨局残留。
-function clearSides() { userSide.clear(); }
+// ⚠ 只清【传进来的那一份】：不传才清兜底表。多房时清 A 房绝不能碰 B 房。
+function clearSides(sides) { M(sides).clear(); }
 
 // —— 验签 ——（占位：标准 HMAC 结构；具体拼接顺序/算法用控制台「签名调试工具」校准后定稿）
 function verifySign(headers, rawBody, appSecret) {
@@ -192,12 +200,13 @@ function sideFromTeam(payload) {
 // —— 把一条互动回调翻译成 0~N 条 { side, key, count, openid, nickname, avatar } 游戏指令 ——
 // msgType 取 msg_type_str（live_gift / live_like / live_comment）；选队类型字符串待官方确认，
 // 这里用内部约定 'team_select'，由回调路由 /cb/team 映射进来。
-function translate(msgType, payload, defaultSide) {
+// ★sides = 该直播间自己的落座表（rooms.js 的 room.side）。不传 → 用模块级兜底表（本地/自查工具/老包）。
+function translate(msgType, payload, defaultSide, sides) {
   const u = userOf(payload);
   switch (msgType) {
     case 'live_gift': {
-      const first = !chosenSide(u.openid);                  // 落座前判断是否首次互动
-      const side = lockSide(u.openid, defaultSide);          // 首次→落座并锁(随机/DEFAULT);已落座→归原队
+      const first = !chosenSide(u.openid, sides);            // 落座前判断是否首次互动
+      const side = lockSide(u.openid, defaultSide, false, sides);   // 首次→落座并锁(随机/DEFAULT);已落座→归原队
       if (side !== 'left' && side !== 'right') return [];
       const key = giftToKey({ sec_gift_id: payload.sec_gift_id, diamond: payload.gift_value || payload.diamond });
       const count = clampInt(payload.gift_num, 1, 20);     // 连击上限 20，防刷屏
@@ -206,8 +215,8 @@ function translate(msgType, payload, defaultSide) {
       return first ? [{ side, key: 'join', count: 1, ...u }, giftEv] : [giftEv];
     }
     case 'live_like': {
-      const first = !chosenSide(u.openid);
-      const side = lockSide(u.openid, defaultSide);          // 首次→落座并锁;已落座→归原队
+      const first = !chosenSide(u.openid, sides);
+      const side = lockSide(u.openid, defaultSide, false, sides);   // 首次→落座并锁;已落座→归原队
       if (side !== 'left' && side !== 'right') return [];
       if (first) return [{ side, key: 'join', count: 1, ...u }];        // 首次互动=正式加入(join·永久推力+入场小火箭)
       // ★2026-08-04 起按【真实点赞数】下发（原来无条件 count:1，把平台报的 like_num 整个丢掉了）。
@@ -224,14 +233,14 @@ function translate(msgType, payload, defaultSide) {
     case 'live_comment': {
       const intent = commentIntent(commentText(payload));
       if (intent === 'left' || intent === 'right') {         // 1/2 = 显式意愿 → 首次落座 / 已落座也允许改队
-        const prev = chosenSide(u.openid);                   // 改队前在哪边（''=没落座过）
-        const side = lockSide(u.openid, intent, true);        // explicit=true → 观众说了算
+        const prev = chosenSide(u.openid, sides);             // 改队前在哪边（''=没落座过）
+        const side = lockSide(u.openid, intent, true, sides); // explicit=true → 观众说了算
         const switched = !!prev && prev !== side;             // 真的换边了 → 让客户端把他的小火箭挪过去
         return [{ side, key: prev ? 'c666' : 'join', count: 1, switched, from: prev || '', ...u }];
       }
       if (intent === 'cheer') {                              // 666 → 落座锁定：首次随机落座并【加入】;已落座归原队加力
-        const first = !chosenSide(u.openid);
-        const side = lockSide(u.openid, defaultSide);
+        const first = !chosenSide(u.openid, sides);
+        const side = lockSide(u.openid, defaultSide, false, sides);
         return [{ side, key: first ? 'join' : 'c666', count: 1, ...u }];  // 首次→加入(永久推力);已落座→加力
       }
       return [];                                             // 其余评论(闲聊)→ 不落座、不下发
@@ -239,8 +248,8 @@ function translate(msgType, payload, defaultSide) {
     case 'team_select': {                                   // 原生选队 = 显式意愿：首次落座 / 已落座也允许改队
       const raw = sideFromTeam(payload);
       if (!raw) return [];
-      const prev = chosenSide(u.openid);
-      const side = lockSide(u.openid, raw, true);            // explicit=true，同评论 1/2
+      const prev = chosenSide(u.openid, sides);
+      const side = lockSide(u.openid, raw, true, sides);    // explicit=true，同评论 1/2
       const switched = !!prev && prev !== side;
       return [{ side, key: prev ? 'c666' : 'join', count: 1, switched, from: prev || '', ...u }];
     }

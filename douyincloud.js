@@ -17,6 +17,7 @@
 'use strict';
 const http = require('http');
 const dy = require('./douyin');
+const rooms = require('./rooms');       // 直播间隔离：本文件的 lastAnchorOpenId 是单主播遗产，多房要按 room_id 认领
 const rank = require('./ranking');
 const cfg = require('./config');
 const ledger = require('./ledger');   // 玩法积分账本：真机这条路也必须记，否则线上账是空的
@@ -135,8 +136,10 @@ async function startGame(headers, body) {
     } else log('token 置换失败（端点/有效期？）');
   }
   log('开局', ctx.roomId, ctx.nickName);
-  dy.clearSides();                                       // 每局重新拉队：清空上一局的落座锁定（与客户端 reset 清永久推力对齐）
-  if (ctx.anchorOpenId) lastAnchorOpenId = ctx.anchorOpenId;     // 供下行 pushToClient / 战绩用
+  // ★清落座只清【这个主播自己房间】的：原来 clearSides() 清的是全局表，
+  //   于是 A 主播开新局会把正在播的 B 主播房里所有观众的阵营一起清掉。
+  if (ctx.anchorOpenId) dy.clearSides(rooms.get(ctx.anchorOpenId).side); else dy.clearSides();
+  if (ctx.anchorOpenId) lastAnchorOpenId = ctx.anchorOpenId;     // 供下行 pushToClient / 战绩用（单主播遗产，多房已改走 rooms 索引）
   if (ctx.roomId) await startTasks(ctx.roomId);
   if (ctx.roomId) rank.startRound(ctx.roomId, ctx.anchorOpenId);   // 传该场主播 openid(动态·非固定 env)          // 本局榜：开局
   return ctx;
@@ -153,9 +156,14 @@ async function liveDataCallback(headers, rawBody) {
   if (!Array.isArray(items)) items = [items];
   log('收到回调 type=' + msgType + ' 条数=' + items.length +
       ' anchor=' + (headers['x-anchor-openid'] ? '头携带' : (lastAnchorOpenId ? '回退开局存的' : '⚠️空(下行会丢,exe 没开过局?)')));
+  // ★按 room_id 认领房间：这条内网专线是【所有主播共用一个地址】的，
+  //   不认领的话 A 房的礼物会记进 B 房的账 —— 钱串场比特效串场严重得多。
+  const roomId = headers['x-roomid'] || headers['x-room-id'] || (items[0] && items[0].room_id) || '';
+  const rm = rooms.anchorOfRoomId(roomId) ? rooms.byRoom(roomId)
+           : rooms.get(anchorOpenId || rooms.DEFAULT_ANCHOR);
   for (const item of items) {
-    const events = dy.translate(msgType, item, cfg.DEFAULT_SIDE);     // → [{side,key,count}]
-    for (const ev of events) ledger.record(ev);                       // 玩法积分入账（唯一真源，与 dev 的 /cb/* 同一口径）
+    const events = dy.translate(msgType, item, cfg.DEFAULT_SIDE, rm.side);   // → [{side,key,count}]
+    for (const ev of events) ledger.record(rm, ev);                   // 玩法积分入账（唯一真源，与 dev 的 /cb/* 同一口径）
     if (events.length) {
       log('→ 翻译', JSON.stringify(events), '下行至', anchorOpenId ? (anchorOpenId.slice(0, 10) + '…') : '⚠️无openid(不下行)');
       await pushToClient(anchorOpenId, item.msg_id, msgType, JSON.stringify(events));

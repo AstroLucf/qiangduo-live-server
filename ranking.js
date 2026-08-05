@@ -187,7 +187,9 @@ function roundResultOf(side, winnerSide) {
   return side === winnerSide ? 1 : 2;
 }
 
-async function endRound(roomId, winnerSide) {
+// room 必传（2026-08-05）：参战名单要取【本房】的，否则 A 房结束会把 B 房观众
+// 一起挂在 A 的 room_id 下报给平台 —— 平台侧的错数据比自己家的错数据更难收拾。
+async function endRound(roomId, winnerSide, room) {
   if (!ENABLED) return;
   const R = rounds.get(roomId);
   if (!R) { log('endRound: 无活动对局', roomId); return; }
@@ -195,7 +197,7 @@ async function endRound(roomId, winnerSide) {
   const end = nowSec();
   // 本局参与者从账本现取（fresh = 本局贡献，pts 口径，与客户端结算面板同一个数）。
   // ★index.js 里 ledger.settle() 跑在本函数【之前】，所以 winStreak 已是本局结果，可直接上报。
-  const ranked = uploadable(ledger.roundList(), '本局榜');
+  const ranked = uploadable(ledger.roundList(room), '本局榜');
   const userItems = ranked.map((u) => ({
     open_id: u.openId, rank: u.rank, score: u.score,
     round_result: roundResultOf(u.side, winnerSide),

@@ -55,7 +55,9 @@ async function hydrate() {
       const v = JSON.parse(h[a]);
       // ⚠ u（单位标记）必须原样带进内存 —— 漏掉它，下次重启会把已经迁过的记录当成旧的【再迁一次】，
       //   底池每重启一次 ×1000。这条是 2026-08-03 实测抓到的，别再改回只取 p/o/t。
-      const rec = normUnit({ p: +v.p || 0, o: !!v.o, t: v.t || 0, u: v.u });
+      // ⚠ r（每人本局分）同理必须带进来 —— 漏掉它，落盘了也白落，重启后 round 全归零。
+      //   2026-08-05 加这个字段时就差点漏掉，和 u 是同一类错：解析处少写一个键，持久化就等于没做。
+      const rec = normUnit({ p: +v.p || 0, o: !!v.o, t: v.t || 0, u: v.u, r: v.r });
       mem.set(a, rec); n++;
       if (rec.u !== v.u) migrated.push(a);            // 本次刚换算的，要写回 Redis
     } catch (_) {}
@@ -94,13 +96,26 @@ function get(anchor) {
     if (kv.enabled) kv.hset(KEY, [a, JSON.stringify(v)]).catch(() => {});
     log(`底池单位迁移 票→分 ×${LEGACY_VOTE_TO_SCORE}：${a.slice(0, 8)}… → ${v.p}`);
   }
-  return { anchor: a, pool: Math.max(0, Math.round(v.p || 0)), open: !!v.o, at: v.t || 0, ready: hydrated };
+  return { anchor: a, pool: Math.max(0, Math.round(v.p || 0)), open: !!v.o, at: v.t || 0, ready: hydrated,
+           rounds: v.r || null };   // r = {openId: 本局分}，跟着主播跨重启恢复
 }
 
-// 客户端每局结转后（以及局中低频心跳）推上来。写内存 + 落 Redis，失败不抛。
-async function set(anchor, pool, open) {
+// 每局结转后（以及局中低频心跳）落盘。写内存 + 落 Redis，失败不抛。
+// ★2026-08-05：除底池外，把【每人的本局分】也一起存 —— 用户定「所有状态跟着主播走」。
+//   ⚠ 只存 round>0 的前 ROUND_CAP 名：一场几千观众全存进一条 JSON 会把记录撑爆。
+//     被截掉的人下次开局 round 从 0 起（他们本来分就低），这是明确的取舍、不是 bug —— 
+//     所以下面会把截掉的人数打进日志，不静默丢。
+const ROUND_CAP = 200;
+async function set(anchor, pool, open, local) {
   const a = norm(anchor);
+  let r;
+  if (local instanceof Map) {
+    const arr = [...local.entries()].filter(([, l]) => (l.round || 0) > 0).sort((x, y) => y[1].round - x[1].round);
+    if (arr.length > ROUND_CAP) log(`本局分落盘截断：${arr.length} 人 → 只存前 ${ROUND_CAP} 名（${a.slice(0, 8)}…）`);
+    r = {}; for (const [id, l] of arr.slice(0, ROUND_CAP)) r[id] = l.round;
+  }
   const v = { p: Math.max(0, Math.round(+pool || 0)), o: !!open, t: Date.now(), u: UNIT_TAG };
+  if (r) v.r = r;
   mem.set(a, v);
   if (kv.enabled) await kv.hset(KEY, [a, JSON.stringify(v)]);
   return get(a);

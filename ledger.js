@@ -35,12 +35,13 @@ const STREAK_SPLIT = { 1: [1], 2: [0.6, 0.4], 3: [0.5, 0.3, 0.2] };
 const ACCT_KEY = 'qd:acct';       // Redis hash：field = openId，value = JSON（只存跨局字段）
 const META_KEY = '__meta__';      // 同一张 hash 里借一格存周/月戳，省一个 key
 
-const accounts = new Map();       // openId -> 账户
-let roundPool = 0;                // 本局积分池 = 底池 + 本局新打
-let poolOpen = false;             // 本局是否还没结转（含义同 score.js 的 roundOpen）
-let roundActive = false;          // 主播点了「开始」才计分：客户端在开始界面会丢弃所有事件，
-                                  // 服务端不跟着门控就会比客户端多记一批（观众在封面期间的互动）
-let anchor = '';                  // 当前主播 openid（底池按他存）
+const R = require('./rooms');
+// ★2026-08-05 多直播间隔离：账本拆两层★
+//   accounts（本文件）= 【跨房累计】name/avatar/total/week/month/streak/winStreak —— 世界榜口径，全平台一份。
+//   room.local（rooms.js）= 【本房本局】fresh/round/likes/gifts/side + 积分池 + roundActive。
+//   此前两类混在同一个 Map、且积分池/对局态是进程级全局单值 —— 几个直播间同开时，
+//   A 房刷的礼物涨到 B 房的池子里、结算把别房的观众也算进来分钱。这是钱串场的根。
+const accounts = new Map();       // openId -> 跨房账户
 let hydrated = false;
 
 function log(...a) { console.log('[ledger]', ...a); }
@@ -52,7 +53,8 @@ const monthKey = (d) => { d = d || new Date(); return d.getFullYear() + '-' + (d
 //   winStreak = 平台要的【连胜次数】——赢一局 +1、输/平清零，上报 winning_streak_count 用。
 //   旧代码里 ranking.js 自己维护后者、score.js 维护前者，两边都叫 streak，是混淆的源头。
 function blank(openId) {
-  return { openid: openId, name: '', avatar: '', total: 0, week: 0, month: 0, streak: 0, winStreak: 0, round: 0, fresh: 0, likes: 0, gifts: 0, side: null };
+  // ⚠ 只放【跨房】字段。fresh/round/likes/gifts/side 属本房本局，在 rooms.js 的 room.local 里。
+  return { openid: openId, name: '', avatar: '', total: 0, week: 0, month: 0, streak: 0, winStreak: 0 };
 }
 function acct(openId) {
   let a = accounts.get(openId);
@@ -71,7 +73,8 @@ function markDirty(id) {
   _flushT = setTimeout(() => { _flushT = null; flush().catch(() => {}); }, 2000);
   if (_flushT.unref) _flushT.unref();
 }
-function packed(a) { return JSON.stringify({ n: a.name, a: a.avatar, t: a.total, w: a.week, m: a.month, s: a.streak, ws: a.winStreak, r: a.round }); }
+// r(round) 已移出：它是【本房本局】的分，跟着房间走、由 pool.js 按主播持久化。
+function packed(a) { return JSON.stringify({ n: a.name, a: a.avatar, t: a.total, w: a.week, m: a.month, s: a.streak, ws: a.winStreak }); }
 async function flush() {
   if (!kv.enabled || !_dirty.size) return;
   const ids = [..._dirty]; _dirty.clear();
@@ -102,7 +105,6 @@ async function hydrate() {
       a.total = +v.t || 0; a.week = wReset ? 0 : (+v.w || 0);
       a.month = mReset ? 0 : (+v.m || 0); a.streak = mReset ? 0 : (+v.s || 0);
       a.winStreak = mReset ? 0 : (+v.ws || 0);      // 连胜次数与连胜池同周期（月）重置
-      a.round = +v.r || 0;
       accounts.set(id, a); n++;
     } catch (_) {}
   }
@@ -131,7 +133,7 @@ async function migrateUnit(meta, n) {
   if (meta.unit === UNIT_TAG) return false;      // 已迁过 → 跳过
   const K = G.LEGACY_VOTE_TO_SCORE;              // 1000
   accounts.forEach((a) => {
-    ['total', 'week', 'month', 'round', 'fresh', 'streak'].forEach((f) => {
+    ['total', 'week', 'month', 'streak'].forEach((f) => {   // round/fresh 已移出跨房账，不在这迁
       a[f] = Math.round((+a[f] || 0) * K);
     });
   });
@@ -152,8 +154,8 @@ const _boot = setTimeout(() => { hydrate().catch(() => {}); }, 800);
 if (_boot.unref) _boot.unref();
 
 // ── 计分：每条翻译好的事件调一次（不是每个 count 调一次，与客户端「连击只第一次计分」对齐）──
-function record(ev) {
-  if (!roundActive) return 0;                       // 主播还没点开始 → 客户端也丢弃，两边一致
+function record(room, ev) {
+  if (!room || !room.active) return 0;                       // 主播还没点开始 → 客户端也丢弃，两边一致
   const id = ev && ev.openid;
   if (!id) return 0;                                // 匿名互动无法归属到人，不进账本（客户端同理只做视觉）
   const unit = G.ptsOf(ev.key);
@@ -168,35 +170,46 @@ function record(ev) {
   //     写了注释 —— 两边对不上过一轮。现在以本函数为准。
   const n = Math.max(1, Math.min(parseInt(ev.count, 10) || 1, 30));
   const pts = unit * n;
-  const a = acct(id);
+  const a = acct(id);                               // 跨房账（世界榜口径）
+  const l = R.local(room, id);                      // 本房局内账
   if (ev.nickname) a.name = ev.nickname;            // 昵称/头像以最新一次为准
   if (ev.avatar) a.avatar = ev.avatar;
-  if (!a.side && (ev.side === 'left' || ev.side === 'right')) a.side = ev.side;   // 落座锁：本局第一次定了就不改
-  a.fresh += pts; a.round += pts; a.week += pts; a.month += pts; a.total += pts;
+  if (!l.side && (ev.side === 'left' || ev.side === 'right')) l.side = ev.side;   // 落座锁：本局第一次定了就不改
+  l.fresh += pts; l.round += pts;                   // ← 本房本局
+  a.week += pts; a.month += pts; a.total += pts;    // ← 跨房累计
   // 计数也按真实次数走：全员分成资格是「刷过礼物 或 点赞 > LIKE_QUALIFY(50)」，
   // 只 +1 的话点赞那条门槛几乎摸不到；礼物笔数同理，5 连击就是 5 笔。
-  if (G.isPaid(ev.key)) a.gifts += n; else a.likes += n;
-  roundPool += pts;
-  poolOpen = true;
+  if (G.isPaid(ev.key)) l.gifts += n; else l.likes += n;
+  room.pool += pts;
+  room.poolOpen = true;
   markDirty(id);
   return pts;
 }
 
 // ── 对局生命周期 ──
-function startRound(anchorOpenId) {
-  if (anchorOpenId) anchor = anchorOpenId;
-  roundActive = true;
-  accounts.forEach((a) => { a.fresh = 0; a.likes = 0; a.gifts = 0; a.side = null; });
-  savePool();
+function startRound(room, anchorOpenId) {
+  if (anchorOpenId) room.anchor = anchorOpenId;
+  room.active = true;
+  R.clearRound(room);              // 只清【本房】局内：fresh/likes/gifts/side + 落座表 + 入场去重
+  savePool(room);
 }
 // 结算：完全照搬 src/score.js 的 settle()，逐条对齐（改任何一条两边一起改）
-function settle(winnerSide) {
-  roundActive = false;
-  const players = [...accounts.values()].filter((u) => u.side);
+function settle(room, winnerSide) {
+  room.active = false;
+  // ★合成视图：把【跨房账 a】和【本房局内账 l】拼成一个临时对象，
+  //   下面那一大段结算数学（前3/全员分成/鼓励分/击败加成/连胜池）就【一行都不用改】，
+  //   算完再按字段归属写回两边。改数学最容易出错，这样把风险隔离在拼装和写回两头。
+  const players = [...room.local.entries()].filter(([, l]) => l.side).map(([id, l]) => {
+    const a = acct(id);
+    return { openid: id, name: a.name, avatar: a.avatar, side: l.side,
+             fresh: l.fresh, round: l.round, likes: l.likes, gifts: l.gifts,
+             total: a.total, week: a.week, month: a.month,
+             streak: a.streak, winStreak: a.winStreak, _a: a, _l: l };
+  });
   const winners = players.filter((u) => u.side === winnerSide).sort((a, b) => b.fresh - a.fresh);
   const losers = players.filter((u) => u.side !== winnerSide);
   const byRound = players.slice().sort((a, b) => b.fresh - a.fresh);
-  const poolVal = Math.round(roundPool * POOL_RATE);
+  const poolVal = Math.round(room.pool * POOL_RATE);
   const bonus = {};
   const add = (u, amt) => { bonus[u.openid] = (bonus[u.openid] || 0) + amt; };
 
@@ -225,10 +238,14 @@ function settle(winnerSide) {
     if (b) { u.round += b; u.week += b; u.month += b; u.total += b; }
     // ⑥ 连胜【次数】（平台 winning_streak_count 用，与上面的连胜池分无关）：赢 +1，输/平清零
     u.winStreak = (winnerSide !== 'tie' && u.side === winnerSide) ? (u.winStreak || 0) + 1 : 0;
+    // ★写回：按字段归属拆回两边 —— 局内进 room.local，跨房进 accounts。漏一处就是数据不落盘。
+    u._l.round = u.round; u._l.fresh = u.fresh; u._l.likes = u.likes; u._l.gifts = u.gifts;
+    u._a.week = u.week; u._a.month = u.month; u._a.total = u.total;
+    u._a.streak = u.streak; u._a.winStreak = u.winStreak;
     markDirty(u.openid);
   });
   flush().catch(() => {});
-  savePool();
+  savePool(room);
   return {
     winnerSide, pool: poolVal, streakPool, perShare: Math.round(perShare),
     rows: byRound.map((u) => ({
@@ -240,62 +257,82 @@ function settle(winnerSide) {
   };
 }
 // 结转：积分池留 INHERIT_RATE 当下一局底池，各人 round 同比例带走
-function nextRound() {
-  accounts.forEach((a) => {
-    a.round = Math.round(a.round * INHERIT_RATE);
-    a.fresh = 0; a.likes = 0; a.gifts = 0; a.side = null;
-    delete a._bonus;
-    markDirty(a.openid);
+function nextRound(room) {
+  room.local.forEach((l) => {
+    l.round = Math.round(l.round * INHERIT_RATE);   // 本局分带走 40%
+    l.fresh = 0; l.likes = 0; l.gifts = 0; l.side = null;
   });
-  roundPool = Math.round(roundPool * INHERIT_RATE);
-  poolOpen = false;
-  roundActive = false;
+  room.pool = Math.round(room.pool * INHERIT_RATE); // 积分池留 40% 当下一局底池
+  room.poolOpen = false;
+  room.active = false;
   flush().catch(() => {});
-  savePool();
-  return roundPool;
+  savePool(room);
+  return room.pool;
 }
 
 // ── 底池借用 pool.js 存（按主播 openid），启动时读回来 ──
-function savePool() { pool.set(anchor, roundPool, poolOpen).catch(() => {}); }
-async function loadPool(anchorOpenId) {
-  if (anchorOpenId) anchor = anchorOpenId;
+// 底池 + 每人的本局分，都按【主播 openid】落盘（用户 2026-08-05：所有状态跟着主播走）
+function savePool(room) { pool.set(room.anchor, room.pool, room.poolOpen, room.local).catch(() => {}); }
+async function loadPool(room, anchorOpenId) {
+  if (anchorOpenId) room.anchor = anchorOpenId;
   await pool.ready();
-  const p = pool.get(anchor);
-  if (!p.ready) return roundPool;
-  roundPool = p.pool;
-  // 上一局没结转（主播结算面板开着就关了 exe / 崩了）→ 现在补一次，否则底池带 100% 越滚越大
-  if (p.open) { roundPool = Math.round(roundPool * INHERIT_RATE); poolOpen = false; savePool(); }
-  else poolOpen = false;
-  return roundPool;
+  const p = pool.get(room.anchor);
+  if (!p.ready) return room.pool;
+  room.pool = p.pool;
+  // 每人的本局分也跟着主播恢复（跨重启/换机都在）
+  if (p.rounds) for (const id in p.rounds) R.local(room, id).round = +p.rounds[id] || 0;
+  // 上一局没结转（主播结算面板开着就关了 exe / 崩了）→ 现在补一次，否则底池带 100% 越滚越大。
+  // ⚠ 必须和 nextRound() 打【同一个折】：只折底池不折每人 round 的话，主播崩过一次，
+  //   观众带进新局的分是 100% 而池子只有 40% —— 结算时按人头分出去的会超过池子该有的量。
+  if (p.open) {
+    room.pool = Math.round(room.pool * INHERIT_RATE);
+    room.local.forEach((l) => { l.round = Math.round((l.round || 0) * INHERIT_RATE); });
+    room.poolOpen = false; savePool(room);
+  } else room.poolOpen = false;
+  return room.pool;
 }
 
 // ── 给客户端的快照 ──
 // 只送用得上的人：本局参与者（fresh>0 或已落座）+ 总榜前 SNAP_TOP，避免观众上万时把 SSE 撑爆。
 const SNAP_TOP = 150;
-function snapshot() {
-  const all = [...accounts.values()];
-  const inRound = all.filter((a) => a.fresh > 0 || a.side);
-  const top = all.slice().sort((x, y) => y.total - x.total).slice(0, SNAP_TOP);
+// 下发给【这个房间】的快照：本房参战者（局内分）+ 总榜前 N（跨房分，给世界榜 tab 用）
+function snapshot(room) {
   const seen = new Set(), list = [];
-  for (const a of inRound.concat(top)) {
-    if (seen.has(a.openid)) continue;
-    seen.add(a.openid);
-    list.push({ openid: a.openid, name: a.name, avatar: a.avatar, total: a.total, week: a.week, month: a.month, streak: a.streak, round: a.round, fresh: a.fresh, likes: a.likes, gifts: a.gifts, side: a.side });
-  }
-  return { type: 'ledger', ready: hydrated, pool: roundPool, poolOpen, active: roundActive, users: list };
+  const put = (id, l) => {
+    if (seen.has(id)) return; seen.add(id);
+    const a = acct(id);
+    list.push({ openid: id, name: a.name, avatar: a.avatar,
+                total: a.total, week: a.week, month: a.month, streak: a.streak,
+                round: l ? l.round : 0, fresh: l ? l.fresh : 0,
+                likes: l ? l.likes : 0, gifts: l ? l.gifts : 0, side: l ? l.side : null });
+  };
+  room.local.forEach((l, id) => { if (l.fresh > 0 || l.side) put(id, l); });   // 本房参战者优先
+  [...accounts.values()].sort((x, y) => y.total - x.total).slice(0, SNAP_TOP)
+    .forEach((a) => put(a.openid, room.local.get(a.openid)));                  // 再补总榜前 N
+  return { type: 'ledger', ready: hydrated, pool: room.pool, poolOpen: room.poolOpen, active: room.active, users: list };
 }
 // ── 只读排行（ranking.js 上报给抖音平台时读这里，不再自己攒一本账）──
 // ⚠ 名次口径三条，别混：
 //   本局榜 = fresh（本局贡献）  · 平台世界榜 = month（月榜，与 world_rank_version=month_YYYYMM 同周期）
 //   入场视频档位 = total（总积分）—— 玩法里「世界榜」的定义就是总积分，结算面板那个 tab 也是它。
 const RANK_CAP = 1000;   // 名次超 1000 固定报 1000（抖音端显示 999+），与 ranking.js 同口径
+// 跨房榜（世界榜/月榜）：只看 accounts
 function ranked(metric) {
   return [...accounts.values()]
     .filter((a) => a[metric] > 0)
     .sort((x, y) => y[metric] - x[metric])
-    .map((a, i) => ({ openId: a.openid, score: a[metric], side: a.side, winStreak: a.winStreak || 0, rank: Math.min(i + 1, RANK_CAP) }));
+    .map((a, i) => ({ openId: a.openid, score: a[metric], winStreak: a.winStreak || 0, rank: Math.min(i + 1, RANK_CAP) }));
 }
-function roundList() { return ranked('fresh'); }
+// 本局榜：只看【这个房间】的局内分。上报本局战绩用它，绝不能拿跨房分去报。
+function roundList(room) {
+  if (!room) return [];
+  return [...room.local.entries()]
+    .filter(([, l]) => l.fresh > 0)
+    .sort((x, y) => y[1].fresh - x[1].fresh)
+    .map(([id, l], i) => ({ openId: id, score: l.fresh, side: l.side,
+                            winStreak: (accounts.get(id) || {}).winStreak || 0,
+                            rank: Math.min(i + 1, RANK_CAP) }));
+}
 function worldList() { return ranked('month'); }
 // 某人在总积分榜的名次（1-based）；不在榜返回 0。入场视频档位靠它。
 function rankOfTotal(openId) {
@@ -311,7 +348,7 @@ function peek(limit) {
     .map((u) => ({ open_id: u.openId, rank: u.rank, score: u.score }));
 }
 
-function diag() { return { accounts: accounts.size, pool: roundPool, poolOpen, active: roundActive, hydrated, anchor: anchor ? anchor.slice(0, 10) + '…' : '(未开局)' }; }
+function diag() { return { accounts: accounts.size, hydrated, rooms: R.diag() }; }
 async function reset(prefix) {
   const hit = [...accounts.keys()].filter((id) => !prefix || id.startsWith(prefix));
   hit.forEach((id) => accounts.delete(id));

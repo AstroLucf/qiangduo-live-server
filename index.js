@@ -18,6 +18,7 @@ const kv = require('./kv');               // 世界榜持久化（诊断用，/h
 const ut = require('./userTeam');         // 「用户快捷选队」开发者侧接口（小摇杆点选阵营）
 const pool = require('./pool');           // 积分池底池存档（按主播 openid 持久化到 Redis）
 const ledger = require('./ledger');       // 观众积分账本（服务端真源：计分/结算/周月榜/连胜）
+const rooms = require('./rooms');         // 直播间隔离：一个主播一个房，特效/积分池/落座互不串
 
 // ── 实例指纹：FaaS 会把服务复制成多个实例分摊流量。每个实例进程启动时生成唯一 ID。
 //    连续刷 /health 若看到多个不同 instance → 多实例（这正是 SSE 0 端的根：连接与回调落不同实例）。
@@ -25,18 +26,17 @@ const INSTANCE_ID = `${process.pid}-${Date.now().toString(36)}-${Math.random().t
 const BOOT_AT = new Date().toISOString();
 let sseSeen = 0;             // 本实例累计见过的 SSE 接入次数（跨实例不共享，仅本实例计数）
 
-const clients = new Set();   // 当前 SSE 连接
-let lastRoomId = '';         // 最近一次回调的 room_id（/round/* 缺省用它）
-let currentRound = { id: 0, status: 2 };   // 当前对局（供「用户快捷选队」查询/选择阵营接口返回 round_id/round_status·1开始2结束）
+// ★2026-08-05 起 clients / lastRoomId / currentRound / eventSeq / recentEvents 全部搬进 rooms.js 按房存。
+//   留在这里的话，几个直播间同开时会互相串场（特效、积分池、落座、结算全串）——
+//   这不是「多写一份状态」的小事，是【A 房观众刷的钱被 B 房的人分走】。别再往这里加全局对局态。
 
 // ── SSE 断点续传：抖音云网关对长连接约 60s 强制掐断 → EventSource 重连，
 //    重连间隙内 broadcast 的礼物会丢。给每批事件编单调递增 seq + 环形缓冲，
 //    客户端重连自动带 Last-Event-ID（SSE 原生），服务端补发缺口 → 间隙不丢。
 //    ⚠ 缓冲是进程内存：补发依赖「SSE 连接与回调落同一实例」，故内测需把抖音云实例数设为 1
 //      （或后续上 KV）。多实例需另解，见 douyincloud.js 的 WS 网关生产链路（不走 SSE，无此限）。
-let eventSeq = 0;                    // 全局单调递增事件序号（= SSE id）
-const recentEvents = [];             // 环形缓冲：[{ seq, frame }]，最近 REPLAY_MAX 条已广播事件
-const REPLAY_MAX = 256;              // 容量：60s 内礼物远不及此；超出则最老的丢（极端积压才触顶）
+//    ★缓冲已按房拆到 rooms.js（seq/recent/REPLAY_MAX 都在那边）：全局一份缓冲时，
+//      多房并发会互相挤掉对方的事件，重连补发还会把别人的礼物补给你。
 const recentRawGifts = [];           // 诊断：最近原始礼物 [{sec_gift_id, gift_value, key, nick}]，供 /rawgifts 回填 GIFT_ID_TO_KEY
 
 // ── 开发期同源静态托管 + 沙盒测试台（cfg.SERVE_STATIC=1；云端不开，故 / 仍是健康探针）──
@@ -95,17 +95,40 @@ Array.prototype.forEach.call(document.querySelectorAll('button'),function(b){b.o
 logln('就绪 — 点按钮，看游戏标签实时反应（同名观众重复点 → 小火箭不应重复生成）');
 </script></body></html>`;
 
-function broadcast(events) {
+// ★2026-08-05 起 broadcast 必须带 room：只发给【这个直播间】的连接。
+//   原来是往全局 clients 里所有连接猛发 —— 几个直播间同开时，A 房的礼物特效出现在所有房间。
+//   ⚠ 新增调用点一律显式传 room；漏传会 throw（而不是静默广播给所有人），这是故意的。
+function broadcast(room, events) {
+  if (!room) throw new Error('broadcast 必须指定 room（防止误发给所有直播间）');
   if (!events || !events.length) return;
   // 用户快捷选队②:观众加入阵营(首次落座=join)时上报阵营给平台。评论/礼物/小摇杆选队 各入口统一在此上报。
-  for (const e of events) { if (e.key === 'join' && e.openid && (e.side === 'left' || e.side === 'right')) rank.uploadUserGroup(e.openid, e.side, lastRoomId); }
-  const seq = ++eventSeq;
-  const frame = `id: ${seq}\ndata: ${JSON.stringify(events)}\n\n`;   // 带 SSE id → 客户端记住进度，断连重连可续传
-  recentEvents.push({ seq, frame });
-  if (recentEvents.length > REPLAY_MAX) recentEvents.shift();        // 环形：超容量丢最老
-  for (const res of clients) { try { res.write(frame); } catch (_) {} }
-  console.log(`[push] #${seq} ${events.map((e) => (e.type ? `${e.type}(${e.users ? e.users.length + '人·池' + e.pool : ''})` : `${e.side}:${e.key}×${e.count}`)).join('  ')}  → ${clients.size} 端`);
+  for (const e of events) { if (e.key === 'join' && e.openid && (e.side === 'left' || e.side === 'right')) rank.uploadUserGroup(e.openid, e.side, room.roomId); }
+  const n = rooms.push(room, events);
+  console.log(`[push] ${room.anchor.slice(0, 8)}#${room.eventSeq} ${events.map((e) => (e.type ? `${e.type}(${e.users ? e.users.length + '人·池' + e.pool : ''})` : `${e.side}:${e.key}×${e.count}`)).join('  ')}  → ${n} 端`);
 }
+// 从请求里认领房间：token（客户端带·最准）→ room_id（抖音回调带）→ 兜底房。
+// 兜底房收留老版本 exe / 本地调试 / 自查工具 —— 它们之间仍会串，但不会污染真实主播的房。
+// 认领顺序有讲究，别改：
+//   ① token —— 客户端 SSE/对局接口带的启动票据，最准（一个 exe 一张）
+//   ② room_id —— 抖音回调只带这个，靠 /start_game 建的索引换主播
+//   ③ 最近一次开局的主播 —— ★向后兼容：老版本 exe 不带 token。
+//      只有一个主播在播时，这一步的结果与改造前【完全一致】，所以升级服务端不需要同步升级 exe。
+//   ④ 兜底房 —— 谁也认不出来（服务端刚重启、自查工具）。会互相串，但不污染真实主播。
+function roomOf(u, req, body) {
+  const tok = (u && u.searchParams.get('token')) || (body && body.token) || '';
+  if (tok) { const a = rooms.anchorOfToken(tok); if (a) return rooms.get(a); }
+  const rid = (body && body.room_id) || (req && req.headers['x-roomid']) || '';
+  if (rid) { const a = rooms.anchorOfRoomId(rid); if (a) return rooms.get(a); }
+  const last = dyc.getAnchorOpenId();
+  if (last) return rooms.get(last);
+  return rooms.get(rooms.DEFAULT_ANCHOR);
+}
+function roomOfRaw(u, req, raw) {                      // 平台回调多为字符串 body（可能是数组）
+  let b = {}; try { b = JSON.parse(raw || '{}'); } catch (_) {}
+  if (Array.isArray(b)) b = b[0] || {};
+  return roomOf(u, req, b);
+}
+const bcOf = (room) => (evs) => broadcast(room, evs);  // 交给 userTeam 的广播器：已绑定房间
 
 // ── 账本快照下行 ──
 // 走的是同一条 SSE，不另开通道：礼物事件已经在这条线上，快照跟着走天然同步、零额外延迟。
@@ -113,13 +136,14 @@ function broadcast(events) {
 // 而积分池/榜单本来就是"看个大概"的显示，1.5s 完全够。开局/结算/结转 走 now=true 立刻推。
 const LEDGER_PUSH_MS = 1500;
 let _ledgerT = null, _ledgerPending = false;
-function pushLedger(now) {
-  if (!clients.size) return;                     // 没人连着就别算快照（snapshot 要排序整表）
-  if (now) { clearTimeout(_ledgerT); _ledgerT = null; _ledgerPending = false; return broadcast([ledger.snapshot()]); }
-  if (_ledgerT) { _ledgerPending = true; return; }
-  broadcast([ledger.snapshot()]);
-  _ledgerT = setTimeout(() => { _ledgerT = null; if (_ledgerPending) { _ledgerPending = false; pushLedger(); } }, LEDGER_PUSH_MS);
-  if (_ledgerT.unref) _ledgerT.unref();
+// 节流状态改成【每房一份】：原来是全局单个定时器，A 房推过之后 B 房要等 1.5s 才轮得到。
+function pushLedger(room, now) {
+  if (!room || !room.clients.size) return;       // 没人连着就别算快照（snapshot 要排序整表）
+  if (now) { clearTimeout(room._lt); room._lt = null; room._lp = false; return broadcast(room, [ledger.snapshot(room)]); }
+  if (room._lt) { room._lp = true; return; }
+  broadcast(room, [ledger.snapshot(room)]);
+  room._lt = setTimeout(() => { room._lt = null; if (room._lp) { room._lp = false; pushLedger(room); } }, LEDGER_PUSH_MS);
+  if (room._lt.unref) room._lt.unref();
 }
 
 function cors(res) {
@@ -144,7 +168,7 @@ const server = http.createServer(async (req, res) => {
 
   // 根路径：抖音云就绪探针可能 GET / 期望 2xx（别落到 404）
   if (path === '/' && req.method === 'GET') {
-    return json(res, 200, { ok: true, service: 'qiangduo-live', clients: clients.size });
+    return json(res, 200, { ok: true, service: 'qiangduo-live', clients: rooms.all().reduce((n, r) => n + r.clients.size, 0) });
   }
 
   // 健康检查
@@ -160,18 +184,19 @@ const server = http.createServer(async (req, res) => {
       battery: has('battery'), mic: has('mic'), airdrop: has('airdrop'),
     };
     // kv：世界榜持久化是否真的接上了（开通 Redis 后一眼确认，不用翻日志）
-    return json(res, 200, { ok: true, instance: INSTANCE_ID, bootAt: BOOT_AT, clients: clients.size, sseSeen, appid: cfg.APPID, skipSign: cfg.DEV_SKIP_SIGN, defaultSide: cfg.DEFAULT_SIDE, giftMap, kv: kv.diag(), pool: pool.diag(), ledger: ledger.diag(),
+    return json(res, 200, { ok: true, instance: INSTANCE_ID, bootAt: BOOT_AT, clients: rooms.all().reduce((n, r) => n + r.clients.size, 0), sseSeen, rooms: rooms.diag(), appid: cfg.APPID, skipSign: cfg.DEV_SKIP_SIGN, defaultSide: cfg.DEFAULT_SIDE, giftMap, kv: kv.diag(), pool: pool.diag(), ledger: ledger.diag(),
       // 上线体检：这三项任一为"裸奔"就别对外开播（cbKey 未设 且 跳过验签 = /cb/* 全网可打）
       guard: { cbKey: !!cfg.CB_KEY, verifySign: !cfg.DEV_SKIP_SIGN, rankOnline: process.env.RANK_ONLINE === '1', mock: cfg.ALLOW_MOCK } });
   }
 
   // 诊断：最近广播的事件（自查工具/真机推送后，看服务端翻译+广播了什么——即使没有游戏连着也能看）。
   if (path === '/recent') {
-    const recent = recentEvents.slice(-40).map((e) => {
+    const _r = roomOf(u, req, null);
+    const recent = _r.recent.slice(-40).map((e) => {
       let events = []; try { const m = e.frame.match(/data: (.+)/); if (m) events = JSON.parse(m[1]); } catch (_) {}
       return { seq: e.seq, events };
     });
-    return json(res, 200, { ok: true, instance: INSTANCE_ID, eventSeq, buffered: recentEvents.length, clients: clients.size, recent });
+    return json(res, 200, { ok: true, instance: INSTANCE_ID, anchor: _r.anchor, eventSeq: _r.eventSeq, buffered: _r.recent.length, clients: _r.clients.size, recent });
   }
 
   // 诊断：最近原始礼物身份（送一次礼物后开此网址，直接读 sec_gift_id 回填 douyin.js 的 GIFT_ID_TO_KEY）。
@@ -190,7 +215,7 @@ const server = http.createServer(async (req, res) => {
   //   · 空 且 /rawgifts 也没有该礼物 → 平台压根没推 = 该礼物不在当前生效的玩法礼物配置里。
   //   room 不传则用最近一次回调的 room_id。本地跑必然 reachable 失败（内网 host 只在抖音云解析）。
   if (path === '/failgifts') {
-    const room = u.searchParams.get('room') || lastRoomId;
+    const room = u.searchParams.get('room') || roomOf(u, req, null).roomId;
     const r = await dyc.failData(room, u.searchParams.get('type') || 'live_gift',
       parseInt(u.searchParams.get('page') || '1', 10), parseInt(u.searchParams.get('size') || '100', 10));
     return json(res, 200, { ok: true, room, resp: r });
@@ -207,19 +232,20 @@ const server = http.createServer(async (req, res) => {
     res.write(': connected\n\n');
     // 断点续传：重连时客户端自动带 Last-Event-ID（首连为空）→ 补发断连间隙漏掉的事件。
     // 整段同步执行（无 await）→ 补发与 add 在同一事件循环 tick 内原子完成，不与 broadcast 竞态。
+    // ★seq 是【每房】独立编号的 —— 补发必须在认领到房之后按本房缓冲找，
+    //   否则重连的主播会收到别人房间的事件（这正是「特效出现在所有直播间」的另一半）。
+    const room = roomOf(u, req, null);
     const lastId = parseInt(req.headers['last-event-id'] || u.searchParams.get('lastEventId') || '0', 10);
-    if (lastId > 0) {
-      const miss = recentEvents.filter((e) => e.seq > lastId);
-      for (const e of miss) { try { res.write(e.frame); } catch (_) {} }
-      if (miss.length) console.log(`[sse] 重连补发 ${miss.length} 条 (Last-Event-ID=${lastId})`);
-    }
-    clients.add(res); sseSeen++;
+    const miss = rooms.replay(room, lastId);
+    for (const e of miss) { try { res.write(e.frame); } catch (_) {} }
+    if (miss.length) console.log(`[sse] 重连补发 ${miss.length} 条 (Last-Event-ID=${lastId})`);
+    rooms.addClient(room, res); sseSeen++;
     const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch (_) {} }, 15000);
     // 主动 50s 优雅关闭：早于网关 ~60s 强制掐断，让客户端在可控时机收正常 EOF 后按 retry 重连，
     // 间隙更短更稳；配合上面的补发 → 跨重连零丢失。
     const cycle = setTimeout(() => { try { res.end(); } catch (_) {} }, 50000);
-    req.on('close', () => { clearInterval(ping); clearTimeout(cycle); clients.delete(res); console.log(`[sse] 断开 (剩 ${clients.size})`); });
-    console.log(`[sse] 接入 (共 ${clients.size})`);
+    req.on('close', () => { clearInterval(ping); clearTimeout(cycle); rooms.delClient(room, res); console.log(`[sse] 断开 ${room.anchor.slice(0, 8)}… (本房剩 ${room.clients.size})`); });
+    console.log(`[sse] 接入 ${room.anchor.slice(0, 8)}… (本房共 ${room.clients.size}·全站 ${rooms.diag().count} 房)`);
     return;
   }
 
@@ -246,10 +272,14 @@ const server = http.createServer(async (req, res) => {
     //   头像空、整批"0 事件被丢弃"。改为逐条 translate（与 douyincloud.js 生产路径一致）。
     let items; try { const p = JSON.parse(raw || '[]'); items = Array.isArray(p) ? p : [p]; } catch (_) { items = []; }
     const roomId = req.headers['x-roomid'] || (items[0] && items[0].room_id) || '';
-    if (roomId) lastRoomId = roomId;
+    // ★路由到该 room_id 对应主播的房：落座表、积分池、入场去重、SSE 目标全部取本房的。
+    //   认不出来（服务端重启过、exe 还没开局）→ roomOf 会退回「最近开局的主播」，
+    //   与改造前单主播行为一致，观众的钱不会凭空消失。
+    const room = rooms.byRoom(roomId).anchor === rooms.DEFAULT_ANCHOR ? roomOf(u, req, items[0]) : rooms.byRoom(roomId);
+    if (roomId) room.roomId = roomId;
     let events = [];
     for (const item of items) {
-      const evs = dy.translate(msgType, item, cfg.DEFAULT_SIDE);
+      const evs = dy.translate(msgType, item, cfg.DEFAULT_SIDE, room.side);
       // 诊断：(空!)=该字段没取到
       if (evs[0]) console.log(`[cb→] side=${evs[0].side} key=${evs[0].key} openid=${evs[0].openid || '(空!)'} avatar=${evs[0].avatar ? '有' : '(空!)'} nick=${evs[0].nickname || '(空)'}`);
       else console.log(`[cb→] ${msgType} → 0 事件（未选队 / 字段取空被丢弃）`);
@@ -258,7 +288,7 @@ const server = http.createServer(async (req, res) => {
       //   逐条 translate 结果记一次 —— 连击的 count 不重复计分，与客户端 `scoring: i===0` 对齐。
       //   ⚠ 必须在 noteInteraction【之前】：入场视频要按名次分档，而名次现在由账本算，
       //     先记账他才有名次。旧代码这条顺序是靠 recordGift 保证的，换真源后同样要守住。
-      for (const ev of evs) ledger.record(ev);
+      for (const ev of evs) ledger.record(room, ev);
       if (msgType === 'live_gift') {
         // 诊断：记原始礼物身份 → /rawgifts 一键读 sec_gift_id 回填映射表（尤其审核抓的漏配礼物）
         // ★mapped 必看：false = 这个 sec_gift_id 不在 GIFT_ID_TO_KEY 里，giftToKey 兜底成了 wand。
@@ -286,11 +316,11 @@ const server = http.createServer(async (req, res) => {
       //   连带修好「返回重开后落座没特效、刷礼物才播」——见 userTeam.noteInteraction 的注释。
       if (evs.length) {
         const isJoin = evs.some((e) => e.key === 'join');   // 落座（首次互动=正式加入）才是入场视频该播的时刻
-        ut.noteInteraction(evs[0], broadcast, rank.worldRankOf, msgType === 'live_gift', isJoin);
+        ut.noteInteraction(evs[0], bcOf(room), rank.worldRankOf, msgType === 'live_gift', isJoin, room);
       }
     }
-    broadcast(events);
-    pushLedger();
+    broadcast(room, events);
+    pushLedger(room);
     // TODO(联调)：收到并处理成功后，调抖音「履约数据上报」做 ack（去重 + 结算依据）。
     return json(res, 200, { ok: true, applied: events.length });
   }
@@ -299,37 +329,50 @@ const server = http.createServer(async (req, res) => {
   // 缺 room_id 时用最近回调的 room（生产由玩法启动参数带 room_id 更准）。
   if ((path === '/round/start' || path === '/round/end') && req.method === 'POST') {
     let body = {}; try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
-    const roomId = body.room_id || lastRoomId;
+    const room = roomOf(u, req, body);
+    const roomId = body.room_id || room.roomId;
+    const anchor = room.anchor === rooms.DEFAULT_ANCHOR ? dyc.getAnchorOpenId() : room.anchor;
     if (path === '/round/start') {
-      dy.clearSides(); ut.resetRoundEnter(); rank.startRound(roomId, dyc.getAnchorOpenId());
-      await ledger.loadPool(dyc.getAnchorOpenId());   // 先把底池读回来，再开局（顺序不能反：开局会 savePool）
-      ledger.startRound(dyc.getAnchorOpenId());
-      currentRound = { id: currentRound.id + 1, status: 1 };
-      pushLedger(true);
-      return json(res, 200, { ok: true, roomId, roundId: currentRound.id, pool: ledger.snapshot().pool });
+      dy.clearSides(room.side); ut.resetRoundEnter(room); rank.startRound(roomId, anchor);
+      await ledger.loadPool(room, anchor);            // 先把底池读回来，再开局（顺序不能反：开局会 savePool）
+      ledger.startRound(room, anchor);
+      room.round = { id: (room.round ? room.round.id : 0) + 1, status: 1 };   // 局号也按房，别再用全局
+      pushLedger(room, true);
+      return json(res, 200, { ok: true, roomId, roundId: room.round.id, pool: ledger.snapshot(room).pool });
     }
     const winner = body.winner === 'left' || body.winner === 'right' ? body.winner : 'tie';
     // ★结算在服务端算：客户端拿这份结果直接渲染，两边不会各算各的。
     //   连不上服务端（纯 demo）时客户端仍用自己那套算 —— 见 src/score.js 的 settle。
     // ⚠ 必须跑在 rank.endRound【之前】：上报给平台的 winning_streak_count 要的是本局结算【之后】
     //   的连胜次数，而它是在 settle 里算的。顺序反了会永远少上报一局。
-    const result = ledger.settle(winner);
-    rank.endRound(roomId, winner);
-    currentRound.status = 2;
-    pushLedger(true);
+    const result = ledger.settle(room, winner);
+    rank.endRound(roomId, winner, room);
+    if (room.round) room.round.status = 2;
+    pushLedger(room, true);
     return json(res, 200, { ok: true, roomId, winner, settle: result });
   }
   // 结转：客户端点结算面板「返回」时调 —— 积分池留 40% 当下一局底池
   if (path === '/round/next' && req.method === 'POST') {
-    const p = ledger.nextRound();
-    pushLedger(true);
+    let body = {}; try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
+    const room = roomOf(u, req, body);
+    const p = ledger.nextRound(room);
+    pushLedger(room, true);
     return json(res, 200, { ok: true, pool: p });
   }
 
   // ── 抖音云生产接入（真机）：4 接口，与上面 dev 的 /cb/*+SSE 并存 ──
   if (path === '/start_game' && req.method === 'POST') {
     let body = {}; try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}   // Electron 路径带 {token}
-    return json(res, 200, { ok: true, data: await dyc.startGame(req.headers, body) });
+    const ctx = await dyc.startGame(req.headers, body);
+    // ★这里是【唯一】能同时看到 token、room_id、主播 openid 的地方 —— 两条索引都在此建立。
+    //   之后抖音回调只带 room_id、客户端 SSE 只带 token，都靠这两张表找回主播。
+    if (ctx && ctx.anchorOpenId) {
+      const room = rooms.get(ctx.anchorOpenId);
+      if (ctx.roomId) { room.roomId = ctx.roomId; rooms.bindRoomId(ctx.roomId, ctx.anchorOpenId); }
+      if (body && body.token) rooms.bindToken(body.token, ctx.anchorOpenId);
+      console.log(`[rooms] 开局认领 主播=${ctx.anchorOpenId.slice(0, 10)}… room=${ctx.roomId || '(无)'} token=${body && body.token ? '有' : '(无·老包)'}`);
+    } else console.warn('[rooms] ⚠️ /start_game 没拿到主播 openid → 该 exe 会落兜底房（与其它无主播身份的实例共用）');
+    return json(res, 200, { ok: true, data: ctx });
   }
   if (path === '/live_data_callback' && req.method === 'POST') {
     const raw = await readBody(req);
@@ -350,11 +393,15 @@ const server = http.createServer(async (req, res) => {
   // 「用户快捷选队」开发者侧 2 接口（后台「开发配置」填这两个地址·小摇杆点选阵营）：
   //   ③ 平台查询观众阵营（观众打开小摇杆时·x-msg-type: user_group）→ 返回该 open_id 当前阵营
   if (path === '/query_user_group' && req.method === 'POST') {
-    return json(res, 200, ut.queryUserGroup(await readBody(req), currentRound));
+    const raw = await readBody(req);
+    const room = roomOfRaw(u, req, raw);
+    return json(res, 200, ut.queryUserGroup(raw, room.round || { id: 0, status: 2 }, room.side));
   }
   //   ④ 观众点选队按钮（平台推·x-msg-type: user_group_push）→ lockSide 落座 + 广播到游戏 → 返回实际阵营
   if (path === '/user_group_push' && req.method === 'POST') {
-    const out = ut.userGroupPush(await readBody(req), currentRound, broadcast, rank.worldRankOf);
+    const raw = await readBody(req);
+    const room = roomOfRaw(u, req, raw);
+    const out = ut.userGroupPush(raw, room.round || { id: 0, status: 2 }, bcOf(room), rank.worldRankOf, room);
     console.log(`[team] 观众选队 → ${JSON.stringify(out.data)}`);
     return json(res, 200, out);
   }
@@ -362,7 +409,7 @@ const server = http.createServer(async (req, res) => {
   if (path === '/audience_change' && req.method === 'POST') {
     const raw = await readBody(req);
     console.log(`[room] 观众进出房 ${(raw || '').slice(0, 160)}`);
-    return json(res, 200, ut.audienceChange(raw, broadcast, rank.worldRankOf));
+    return json(res, 200, ut.audienceChange(raw, bcOf(roomOfRaw(u, req, raw)), rank.worldRankOf, roomOfRaw(u, req, raw)));
   }
   // 运维：看/清 世界榜内存（world 是进程内存，联调假号会占榜前排把真实观众挤下去）。
   //   GET  /api/world            → 看前 N 名（?limit=20）
@@ -389,12 +436,13 @@ const server = http.createServer(async (req, res) => {
   //   主播身份由服务端自己认（/start_game 置换出来的 anchorOpenId），客户端不传、也伪造不了。
   if (path === '/pool' && req.method === 'GET') {
     await pool.ready();     // 别在还没从 Redis 读回来时就答复 —— 客户端会拿 ready:false 之外的空池覆盖本地
-    return json(res, 200, { ok: true, ...pool.get(dyc.getAnchorOpenId()) });
+    return json(res, 200, { ok: true, ...pool.get(roomOf(u, req, null).anchor) });
   }
   if (path === '/pool' && req.method === 'POST') {
     let body = {}; try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
     if (body.pool == null) return json(res, 400, { ok: false, err: 'pool required' });
-    const r = await pool.set(dyc.getAnchorOpenId(), body.pool, body.open);
+    const _room = roomOf(u, req, body);
+    const r = await pool.set(_room.anchor, body.pool, body.open, _room.local);
     console.log(`[pool] 存档 anchor=${r.anchor.slice(0, 10)}… pool=${r.pool} open=${r.open}`);
     return json(res, 200, { ok: true, ...r });
   }
@@ -412,7 +460,7 @@ const server = http.createServer(async (req, res) => {
   //   POST /api/ledger/reset    → 清账（同 /world/reset 鉴权；联调假号用 prefix 定点清）
   if (path === '/ledger' && req.method === 'GET') {
     await ledger.ready();
-    return json(res, 200, { ok: true, ...ledger.snapshot() });
+    return json(res, 200, { ok: true, ...ledger.snapshot(roomOf(u, req, null)) });
   }
   if (path === '/ledger/reset' && req.method === 'POST') {
     let body = {}; try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
@@ -444,7 +492,7 @@ const server = http.createServer(async (req, res) => {
     const side = u.searchParams.get('side') || 'left';
     const key = u.searchParams.get('key') || 'donut';
     const count = Math.max(1, Math.min(parseInt(u.searchParams.get('count') || '1', 10), 20));
-    broadcast([{ side, key, count, from: 'mock' }]);
+    broadcast(roomOf(u, req, null), [{ side, key, count, from: 'mock' }]);
     return json(res, 200, { ok: true, side, key, count });
   }
 
