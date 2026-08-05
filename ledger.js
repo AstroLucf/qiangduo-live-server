@@ -195,7 +195,13 @@ function record(room, ev) {
 
 // ── 对局生命周期 ──
 function startRound(room, anchorOpenId) {
-  if (anchorOpenId) room.anchor = anchorOpenId;
+  // ⚠ 绝不就地改写 room.anchor：房间的身份是 rooms 的【Map 键】，改这里键不会跟着变，
+  //   会造出「兜底房顶着真实主播的名字」和「同一 anchor 两个 room 对象」。调用方负责取对房。
+  //   只在房还没有身份时补一次（正常不会发生），不一致就告警，别静默走下去。
+  if (anchorOpenId && anchorOpenId !== room.anchor) {
+    if (!room.anchor || room.anchor === R.DEFAULT_ANCHOR) room.anchor = anchorOpenId;
+    else log(`⚠️ anchor 不一致：房=${String(room.anchor).slice(0, 10)}… 传入=${String(anchorOpenId).slice(0, 10)}… → 以房为准`);
+  }
   room.active = true;
   R.clearRound(room);              // 只清【本房】局内：fresh/likes/gifts/side + 落座表 + 入场去重
   savePool(room);
@@ -253,6 +259,9 @@ function settle(room, winnerSide) {
   });
   flush().catch(() => {});
   savePool(room);
+  // ★入场视频名次【按局冻结】：本局结算完(奖励已入 total)后把世界榜定格一份，供【下一局】进场查档。
+  //   放在这里 = 每局结算刷新一次；本局进行中送礼不改这份榜，到下一局进场才生效（见 rankOfTotal）。
+  room.rankSnap = freezeRankSnap();
   return {
     winnerSide, pool: poolVal, streakPool, perShare: Math.round(perShare),
     rows: byRound.map((u) => ({
@@ -291,7 +300,13 @@ function savePool(room) {
   pool.set(room.anchor, room.pool, room.poolOpen, room.local).catch(() => {});
 }
 async function loadPool(room, anchorOpenId) {
-  if (anchorOpenId) room.anchor = anchorOpenId;
+  // ⚠ 绝不就地改写 room.anchor：房间的身份是 rooms 的【Map 键】，改这里键不会跟着变，
+  //   会造出「兜底房顶着真实主播的名字」和「同一 anchor 两个 room 对象」。调用方负责取对房。
+  //   只在房还没有身份时补一次（正常不会发生），不一致就告警，别静默走下去。
+  if (anchorOpenId && anchorOpenId !== room.anchor) {
+    if (!room.anchor || room.anchor === R.DEFAULT_ANCHOR) room.anchor = anchorOpenId;
+    else log(`⚠️ anchor 不一致：房=${String(room.anchor).slice(0, 10)}… 传入=${String(anchorOpenId).slice(0, 10)}… → 以房为准`);
+  }
   await pool.ready();
   const p = pool.get(room.anchor);
   if (!p.ready) return room.pool;      // 读不到就别动 room.pool，也别让 savePool 拿它去覆盖存档
@@ -369,14 +384,23 @@ function roundList(room) {
                             rank: Math.min(i + 1, RANK_CAP) }));
 }
 function worldList() { return ranked('month'); }
-// 某人在总积分榜的名次（1-based）；不在榜返回 0。入场视频档位靠它。
-function rankOfTotal(openId) {
+// 入场视频的名次【按局冻结】—— 每局结算(settle)时把当时的世界榜定格一份，本局进行中送礼【不即时改档】。
+// 口径同结算面板世界榜 ranked('total')：① 只收 total>0 的人（没积分不上榜）；② 按排序序位给名次，
+// 同分也落不同档（不再像旧的严格 `>` 计数那样把同分全并成「榜一」→ 一堆人共用同一条入场视频）。
+function freezeRankSnap() {
+  const snap = new Map();
+  ranked('total').forEach((u) => snap.set(u.openId, u.rank));   // openId -> 名次(1-based·含 RANK_CAP 封顶)
+  return snap;
+}
+// 查某人的【入场视频名次】(1-based)：只读上一局结算时冻结的那份榜(room.rankSnap)，不再实时查 accounts。
+// · 首局 / 服务端重启后的第一局还没有冻结榜 → 一律 0(不播) → 天然实现「第二局进场才有入场特效」。
+// · 不在冻结榜里(上一局结算时没积分/没上榜) → 0(没积分不上榜)。
+// ★2026-08-05 用户定：排行榜每局结算一次，本局刷的礼物到【下一局】进场才生效，不再实时结算。
+function rankOfTotal(openId, room) {
   if (!openId) return 0;
-  const a = accounts.get(openId);
-  if (!a || !a.total) return 0;
-  let n = 1;
-  for (const o of accounts.values()) if (o.total > a.total) n++;
-  return n;
+  const snap = room && room.rankSnap instanceof Map ? room.rankSnap : null;
+  if (!snap) return 0;
+  return snap.get(openId) || 0;
 }
 function peek(limit) {
   return ranked('total').slice(0, Math.max(1, Math.min(+limit || 20, 150)))

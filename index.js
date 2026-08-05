@@ -369,12 +369,34 @@ const server = http.createServer(async (req, res) => {
   // 缺 room_id 时用最近回调的 room（生产由玩法启动参数带 room_id 更准）。
   if ((path === '/round/start' || path === '/round/end') && req.method === 'POST') {
     let body = {}; try { body = JSON.parse((await readBody(req)) || '{}'); } catch (_) {}
-    const room = roomOf(u, req, body);
+    // ★认到兜底房时，要【换成那个主播真正的房】，不能给兜底房贴上他的名字（2026-08-05 线上抓到）★
+    //   原来是 `anchor = 兜底 ? dyc.getAnchorOpenId() : room.anchor`，然后 loadPool/startRound 里
+    //   `room.anchor = anchorOpenId` 就地改写 —— 但 rooms 是按【Map 键】存的，键不会跟着改。
+    //   后果：兜底房顶着真实主播的名字，savePool 把【兜底房的池子】写进那位主播的存档；
+    //   同一个 anchor 还会存在两个 room 对象（一个键是 __default__、一个是真 anchor）。
+    //   线上实测见到过 anchor 和 roomId 对不上的房间记录，就是这么来的。
+    //   现在：认不出身份就退到「最近开局的主播」那个【真房】，兜底房永远保持匿名。
+    let room = roomOf(u, req, body);
+    if (room.anchor === rooms.DEFAULT_ANCHOR) {
+      const last = dyc.getAnchorOpenId();
+      if (last) { room = rooms.get(last); console.log(`[rooms] /round/* 认到兜底房 → 改用最近开局的主播 ${last.slice(0, 10)}… 的真房`); }
+    }
     const roomId = body.room_id || room.roomId;
-    const anchor = room.anchor === rooms.DEFAULT_ANCHOR ? dyc.getAnchorOpenId() : room.anchor;
+    const anchor = room.anchor;
     if (path === '/round/start') {
       dy.clearSides(room.side); ut.resetRoundEnter(room); rank.startRound(roomId, anchor);
-      await ledger.loadPool(room, anchor);            // 先把底池读回来，再开局（顺序不能反：开局会 savePool）
+      // ★只在【不在局中】时才从存档读底池（2026-08-05 线上抓到）★
+      //   loadPool 会 `room.pool = 存档值`。存档是在【上一次开局那一刻】写的，
+      //   所以局中再来一次 /round/start（主播重复点开始 / exe 重连重发 / reset），
+      //   会把本局观众已经刷进去的钱整个抹掉 —— 实测 521000 → 0，钱凭空消失。
+      //   本局已经在跑就说明底池早已恢复过，没有再读一次的理由。
+      //   区分两种「active 仍是 true 时的开局」：
+      //     (a) 同一次 exe 会话里重复发 /round/start（主播重复点、客户端重发）→ 不能重读，会抹掉本局的钱
+      //     (b) 主播结算面板开着就关了 exe、隔一会儿回来重开 → 必须重读并补那次 40% 折
+      //   两者的区别是 (b) 一定先走过 /start_game —— 用它打的 needReload 标记来分。
+      if (!room.active || room.needReload) await ledger.loadPool(room, anchor);
+      else console.log(`[rooms] /round/start 重复调用（本局仍在进行、且没重新 /start_game）→ 跳过 loadPool，保住已攒的 ${room.pool}`);
+      room.needReload = false;
       ledger.startRound(room, anchor);
       room.round = { id: (room.round ? room.round.id : 0) + 1, status: 1 };   // 局号也按房，别再用全局
       pushLedger(room, true);
@@ -411,6 +433,9 @@ const server = http.createServer(async (req, res) => {
       if (ctx.roomId) { room.roomId = ctx.roomId; rooms.bindRoomId(ctx.roomId, ctx.anchorOpenId); }
       if (body && body.token) rooms.bindToken(body.token, ctx.anchorOpenId);
       rooms.bindAddr(addrOf(req), ctx.anchorOpenId);   // 老包兜底：记住这台 exe 的出口地址
+      // exe（重新）启动了 → 下一次 /round/start 必须重读存档：
+      // 上一次可能是「结算面板开着就关 exe」，那一局的 40% 折要在读存档时补上。
+      room.needReload = true;
       console.log(`[rooms] 开局认领 主播=${ctx.anchorOpenId.slice(0, 10)}… room=${ctx.roomId || '(无)'} token=${body && body.token ? '有' : '(无·老包)'}`);
     } else console.warn('[rooms] ⚠️ /start_game 没拿到主播 openid → 该 exe 会落兜底房（与其它无主播身份的实例共用）');
     return json(res, 200, { ok: true, data: ctx });
