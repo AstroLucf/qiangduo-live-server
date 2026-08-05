@@ -79,8 +79,10 @@ function hashSide(openid) {
 // 匿名(无 openid)落座：当次随机，无法追踪到人 → 不锁、每次重算。
 function randSide() { return Math.random() < 0.5 ? 'right' : 'left'; }
 // —— 落座锁定(2026-06-30) ——
-// 规则：首次互动即【落座并锁死本局】——评论1/2按方向、其余(礼物/点赞/666)随机定边；
+// 规则：首次互动即【落座并锁死本局】——评论1/2按方向、礼物随机定边；
 // 之后该用户【任何】互动都归这一队、本局内永不改(再喊别的队也不换)。
+// ★2026-08-05 起【只有礼物】会走这条隐式落座：点赞和 666/6/66 已改成「只读不写」，
+//   没下场的人刷这两样一律不下发（见 translate 的 live_like / cheer 分支）。用户定。
 // 开局 clearSides() 清空 → 下一局重新拉队。匿名无身份 → 每次随机、不锁。
 // 这是「随机落座与1/2选队地位相同、一旦落座不得修改」的服务端唯一真源(替代会覆盖的 setSide)。
 // ★2026-08-03 改（用户报「弹幕扣1去了2」）：显式意愿可以改队，隐式落座才锁死。
@@ -215,10 +217,13 @@ function translate(msgType, payload, defaultSide, sides) {
       return first ? [{ side, key: 'join', count: 1, ...u }, giftEv] : [giftEv];
     }
     case 'live_like': {
-      const first = !chosenSide(u.openid, sides);
-      const side = lockSide(u.openid, defaultSide, false, sides);   // 首次→落座并锁;已落座→归原队
-      if (side !== 'left' && side !== 'right') return [];
-      if (first) return [{ side, key: 'join', count: 1, ...u }];        // 首次互动=正式加入(join·永久推力+入场小火箭)
+      // ★2026-08-05 用户定：点赞【不再下场】★
+      //   原来首次点赞会 lockSide 随机落座并发 join（永久推力+入场小火箭）——
+      //   于是路人随手一个赞就被拽进某一队、场上多一枚火箭，观众自己都不知道自己下了场。
+      //   现在只 chosenSide【读】已落座的队，不写：没下过场的人点赞 → 0 事件，不落座、不计分、不出火箭。
+      //   ⚠ 用 chosenSide 不是 lockSide —— lockSide 会写落座表，那正是"下场"本身。
+      const side = chosenSide(u.openid, sides);
+      if (side !== 'left' && side !== 'right') return [];   // 没下场 → 这个赞不进游戏
       // ★2026-08-04 起按【真实点赞数】下发（原来无条件 count:1，把平台报的 like_num 整个丢掉了）。
       //   客户端已改成「屏幕容量固定 + 0.5s 环形桶配额」渲染：来 10 个还是 1000 个，
       //   同屏恒定 LIKE.cap 个、流速恒定 —— 所以放开数量【不会】变成更多 DOM/解码器。
@@ -238,10 +243,13 @@ function translate(msgType, payload, defaultSide, sides) {
         const switched = !!prev && prev !== side;             // 真的换边了 → 让客户端把他的小火箭挪过去
         return [{ side, key: prev ? 'c666' : 'join', count: 1, switched, from: prev || '', ...u }];
       }
-      if (intent === 'cheer') {                              // 666 → 落座锁定：首次随机落座并【加入】;已落座归原队加力
-        const first = !chosenSide(u.openid, sides);
-        const side = lockSide(u.openid, defaultSide, false, sides);
-        return [{ side, key: first ? 'join' : 'c666', count: 1, ...u }];  // 首次→加入(永久推力);已落座→加力
+      if (intent === 'cheer') {
+        // ★2026-08-05 用户定：除 1/2 以外的弹幕【一律不下场】★（666/6/66 同点赞处理）
+        //   与点赞同一条理由：喊个 666 不等于表态选队，不该被随机拽进某一队。
+        //   已下场的人喊 666 照常归原队加力；没下场的 → 0 事件。
+        const side = chosenSide(u.openid, sides);
+        if (side !== 'left' && side !== 'right') return [];
+        return [{ side, key: 'c666', count: 1, ...u }];
       }
       return [];                                             // 其余评论(闲聊)→ 不落座、不下发
     }
