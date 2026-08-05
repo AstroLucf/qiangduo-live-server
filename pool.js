@@ -89,7 +89,15 @@ if (_boot.unref) _boot.unref();
 
 function get(anchor) {
   const a = norm(anchor);
-  const raw = mem.get(a) || mem.get(DEFAULT_ANCHOR) || { p: 0, o: false, t: 0, u: UNIT_TAG };
+  // ★真实主播【不许】回落到兜底格（2026-08-05 线上实测抓到）★
+  //   原来是 `mem.get(a) || mem.get(DEFAULT_ANCHOR) || {p:0}`。单主播时代那句是「迁移」——
+  //   主播身份认出来之前攒在 'default' 里的池子，认出来之后接着用，合理。
+  //   多房隔离之后它变成：【任何一个新主播的第一局，底池不是 0，而是兜底格里别人的钱】。
+  //   线上实测：prod 的 'default' 格有 233589，我用两个全新 anchor 开局，两边都从 233589 起 ——
+  //   这笔钱结算时会真分给他的观众。
+  //   现在只有 anchor 本身就是兜底格（拿不到主播 openid：老包没走 /start_game、token 置换失败）
+  //   才读那一格；真实 anchor 查不到就是 0，从头攒。
+  const raw = mem.get(a) || (a === DEFAULT_ANCHOR ? mem.get(DEFAULT_ANCHOR) : null) || { p: 0, o: false, t: 0, u: UNIT_TAG };
   const v = normUnit(raw);
   if (v !== raw) {                                   // 旧口径 → 就地换算并回写，只发生一次
     mem.set(a, v);
