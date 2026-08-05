@@ -125,9 +125,41 @@ function roomOf(u, req, body) {
   if (tok) { const a = rooms.anchorOfToken(tok); if (a) return rooms.get(a); }
   const rid = (body && body.room_id) || (req && req.headers['x-roomid']) || '';
   if (rid) { const a = rooms.anchorOfRoomId(rid); if (a) return rooms.get(a); }
+  // ③ Last-Event-ID 里的房间标签 —— 老包唯一【确定性】的身份来源。
+  //    SSE 的 event id 形如 `<tag>.<seq>`（rooms.push），浏览器重连会原样带回来。
+  //    只要这条连接收到过一条事件，之后所有重连都能回到同一个房，不会再被换走。
+  const tag = tagFrom(u, req);
+  if (tag) { const a = rooms.anchorOfTag(tag); if (a) return rooms.get(a); }
+  // ③′ 来源地址 —— 首次建连（还没收到过任何事件）时的兜底。
+  //    /start_game 时记下这台 exe 的出口地址，之后它的 /events、/pool、/round/* 都按地址认领。
+  //    ⚠ 必须排在「最近开局的主播」之前：后者是全局单值，几个主播同开时每 50s 一次的 SSE 重连
+  //      会把老包换进别人的房 —— 积分池就是这么在几千/几万/十几万之间乱跳的（实测 200000→7000）。
+  const addr = addrOf(req);
+  if (addr) { const a = rooms.anchorOfAddr(addr); if (a) return rooms.get(a); }
   const last = dyc.getAnchorOpenId();
   if (last) return rooms.get(last);
   return rooms.get(rooms.DEFAULT_ANCHOR);
+}
+// 从 Last-Event-ID / ?lastEventId 里取房间标签。老格式是纯数字（无标签）→ 返回空。
+function tagFrom(u, req) {
+  const raw = String((req && req.headers && req.headers['last-event-id']) ||
+                     (u && u.searchParams.get('lastEventId')) || '');
+  const i = raw.lastIndexOf('.');
+  return i > 0 ? raw.slice(0, i) : '';
+}
+// seq 部分：老格式纯数字直接用，新格式取 '.' 之后
+function seqFrom(u, req) {
+  const raw = String((req && req.headers && req.headers['last-event-id']) ||
+                     (u && u.searchParams.get('lastEventId')) || '0');
+  const i = raw.lastIndexOf('.');
+  return parseInt(i > 0 ? raw.slice(i + 1) : raw, 10) || 0;
+}
+// 出口地址：抖音云前面有网关 → 先取 x-forwarded-for 的第一跳，再退回 socket 地址。
+function addrOf(req) {
+  if (!req) return '';
+  const xf = req.headers && req.headers['x-forwarded-for'];
+  if (xf) return String(xf).split(',')[0].trim();
+  return (req.socket && req.socket.remoteAddress) || '';
 }
 function roomOfRaw(u, req, raw) {                      // 平台回调多为字符串 body（可能是数组）
   let b = {}; try { b = JSON.parse(raw || '{}'); } catch (_) {}
@@ -241,7 +273,7 @@ const server = http.createServer(async (req, res) => {
     // ★seq 是【每房】独立编号的 —— 补发必须在认领到房之后按本房缓冲找，
     //   否则重连的主播会收到别人房间的事件（这正是「特效出现在所有直播间」的另一半）。
     const room = roomOf(u, req, null);
-    const lastId = parseInt(req.headers['last-event-id'] || u.searchParams.get('lastEventId') || '0', 10);
+    const lastId = seqFrom(u, req);
     const miss = rooms.replay(room, lastId);
     for (const e of miss) { try { res.write(e.frame); } catch (_) {} }
     if (miss.length) console.log(`[sse] 重连补发 ${miss.length} 条 (Last-Event-ID=${lastId})`);
@@ -376,6 +408,7 @@ const server = http.createServer(async (req, res) => {
       const room = rooms.get(ctx.anchorOpenId);
       if (ctx.roomId) { room.roomId = ctx.roomId; rooms.bindRoomId(ctx.roomId, ctx.anchorOpenId); }
       if (body && body.token) rooms.bindToken(body.token, ctx.anchorOpenId);
+      rooms.bindAddr(addrOf(req), ctx.anchorOpenId);   // 老包兜底：记住这台 exe 的出口地址
       console.log(`[rooms] 开局认领 主播=${ctx.anchorOpenId.slice(0, 10)}… room=${ctx.roomId || '(无)'} token=${body && body.token ? '有' : '(无·老包)'}`);
     } else console.warn('[rooms] ⚠️ /start_game 没拿到主播 openid → 该 exe 会落兜底房（与其它无主播身份的实例共用）');
     return json(res, 200, { ok: true, data: ctx });

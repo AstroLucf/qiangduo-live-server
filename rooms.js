@@ -25,6 +25,32 @@ const REPLAY_MAX = 256;                // 每房各自的断点续传环形缓�
 const rooms = new Map();               // anchor -> Room
 const byRoomId = new Map();            // roomId -> anchor（抖音回调只带 roomId）
 const byToken = new Map();             // 启动 token -> anchor（SSE 建连只带 token）
+// ★老包兜底（2026-08-05 修「积分池乱跳」）★
+//   1.1.21 及更早的 exe 渲染层【不带 token】连 SSE。多房隔离上线后，这类连接只能退到
+//   「最近一次开局的主播」——而服务端每 50s 主动掐断 SSE 让客户端重连，几个主播同开时
+//   老包每重连一次就可能被换进另一个主播的房，积分池在几千/几万/十几万之间来回跳。
+//   （实测：同一个老包客户端重连前后，收到的池值从 200000 变成 7000。）
+//   用【来源地址】兜：同一台 exe 的 /start_game(主进程) 和 /events(渲染层) 出口 IP 相同，
+//   比「全局最近开局」精确得多。⚠ 仍是启发式：同一出口 IP 的两个主播（同一工作室/CGNAT）
+//   还是会撞。真正的解法是出新包带 token，这里只是让老包不至于乱跳。
+const byAddr = new Map();              // 来源地址 -> anchor
+// ★房间标签：编进 SSE 的 event id（`<tag>.<seq>`）★
+//   老包重连时浏览器会把上一条 id 原样带回来（Last-Event-ID 头 / ?lastEventId=），
+//   服务端据此就能认出「这条连接上次在哪个房」—— 不需要改客户端，是老包唯一确定性的身份来源。
+//   （1.1.21 的 liveBridge 把 lastId 当字符串存、encodeURIComponent 带回，复合 id 能原样往返。）
+const byTag = new Map();               // tag -> anchor
+function tagOf(anchor) {
+  const a = String(anchor || '');
+  let h = 5381;
+  for (let i = 0; i < a.length; i++) h = ((h * 33) ^ a.charCodeAt(i)) >>> 0;
+  // 撞了就往后加序号，绝不让两个主播共用一个 tag —— 共用意味着把人送进别人的房。
+  const base = h.toString(36);
+  let t = base, n = 0;
+  while (byTag.has(t) && byTag.get(t) !== a) { n++; t = base + '-' + n; }
+  byTag.set(t, a);
+  return t;
+}
+const anchorOfTag = (tag) => byTag.get(String(tag || '')) || '';
 
 // 没有 anchor 时的兜底房：老版本 exe 不带 token、本地调试、自查工具都会落这里。
 // 它们之间仍会互相串，但【不会污染真实主播的房间】—— 这是过渡期的隔离底线。
@@ -40,19 +66,22 @@ function blank(anchor) {
     active: false,                     // 主播点了「开始」才计分
     pool: 0,                           // 本局积分池（含上一局结转来的底池）
     poolOpen: false,                   // 本局是否还没结转
+    poolLoaded: false,                 // 底池是否已从存档成功读回；false 时禁止落盘（见 ledger.savePool）
     side: new Map(),                   // openId -> 'left'|'right'  落座锁（每局清）
     entered: new Set(),                // 本局已播过入场视频的 openId
     seen: new Set(),                   // 本局出现过的 openId（判首次）
     cooldown: new Map(),               // openId -> ts  入场视频跨局去抖
+    rankSnap: null,                    // 入场视频名次【按局冻结】快照 openId->名次：settle 时刷新，供【下一局】进场查档（不实时）
     local: new Map(),                  // openId -> {fresh, round, likes, gifts, side}  局内账
     lastSeen: Date.now(),
+    tag: '',                           // SSE event id 前缀，见 byTag 注释；在 get() 里补上
   };
 }
 
 function get(anchor) {
   const a = String(anchor || '').trim() || DEFAULT_ANCHOR;
   let r = rooms.get(a);
-  if (!r) { r = blank(a); rooms.set(a, r); }
+  if (!r) { r = blank(a); r.tag = tagOf(a); rooms.set(a, r); }
   r.lastSeen = Date.now();
   return r;
 }
@@ -66,6 +95,11 @@ function bindToken(token, anchor) {
   if (!token) return;
   byToken.set(String(token), String(anchor || '').trim() || DEFAULT_ANCHOR);
 }
+function bindAddr(addr, anchor) {
+  if (!addr) return;
+  byAddr.set(String(addr), String(anchor || '').trim() || DEFAULT_ANCHOR);
+}
+const anchorOfAddr = (addr) => byAddr.get(String(addr || '')) || '';
 // 回调进来：只有 roomId → 找主播。找不到（服务端重启过、exe 还没 /start_game）落兜底房。
 // ⚠ 落兜底房不是"丢弃"：宁可先记着，也别让观众的钱凭空消失；主播重连后新数据会进正确的房。
 function byRoom(roomId) {
@@ -99,7 +133,7 @@ function delClient(r, res) { r.clients.delete(res); }
 function push(r, events) {
   if (!events || !events.length) return 0;
   const seq = ++r.eventSeq;
-  const frame = `id: ${seq}\ndata: ${JSON.stringify(events)}\n\n`;
+  const frame = `id: ${r.tag}.${seq}\ndata: ${JSON.stringify(events)}\n\n`;   // 带房间标签：老包重连靠它认房
   r.recent.push({ seq, frame });
   if (r.recent.length > REPLAY_MAX) r.recent.shift();
   let n = 0;
@@ -125,6 +159,8 @@ function gc(now) {
     rooms.delete(a); n++;
     for (const [rid, an] of byRoomId) if (an === a) byRoomId.delete(rid);
     for (const [tk, an] of byToken) if (an === a) byToken.delete(tk);
+    for (const [ad, an] of byAddr) if (an === a) byAddr.delete(ad);
+    for (const [tg, an] of byTag) if (an === a) byTag.delete(tg);
   }
   if (n) console.log(`[rooms] 回收 ${n} 个空房（${GC_MS / 3600000}h 无活动）· 剩 ${rooms.size}`);
   return n;
@@ -146,7 +182,7 @@ function diag() {
 
 module.exports = {
   DEFAULT_ANCHOR, GC_MS,
-  get, bindRoomId, bindToken, byRoom, byTok, anchorOfRoomId, anchorOfToken,
+  get, bindRoomId, bindToken, bindAddr, byRoom, byTok, anchorOfRoomId, anchorOfToken, anchorOfAddr, anchorOfTag,
   local, clearRound, addClient, delClient, push, replay, gc, diag,
   all: () => [...rooms.values()],
 };

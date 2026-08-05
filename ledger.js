@@ -279,12 +279,23 @@ function nextRound(room) {
 
 // ── 底池借用 pool.js 存（按主播 openid），启动时读回来 ──
 // 底池 + 每人的本局分，都按【主播 openid】落盘（用户 2026-08-05：所有状态跟着主播走）
-function savePool(room) { pool.set(room.anchor, room.pool, room.poolOpen, room.local).catch(() => {}); }
+// ★没成功读回过就绝不落盘（2026-08-05 修「积分池变成几千」）★
+//   pool.js 在 Redis 读失败时【故意】保持 ready:false —— 它自己都不知道底池是多少。
+//   而 loadPool 遇到 ready:false 会直接 return，紧接着 startRound 却无条件调本函数，
+//   于是把新房的 room.pool（0）写进存档，主播攒了很多局的底池当场清零，
+//   下一局只能从 0 按每人下场 +1000 累起来 —— 屏幕上就是「几千积分」。
+//   底池是要分给观众的钱：宁可这一局不落盘（重启丢本局涨幅），也不能拿一个我们并不知道的值覆盖存档。
+//   ⚠ 跳过时必须打日志，别静默 —— 静默丢盘比写错更难查。
+function savePool(room) {
+  if (!room.poolLoaded) { log('⚠️ 底池尚未成功读回，跳过落盘（防止把存档覆盖成 0）· anchor=' + String(room.anchor).slice(0, 10) + '…'); return; }
+  pool.set(room.anchor, room.pool, room.poolOpen, room.local).catch(() => {});
+}
 async function loadPool(room, anchorOpenId) {
   if (anchorOpenId) room.anchor = anchorOpenId;
   await pool.ready();
   const p = pool.get(room.anchor);
-  if (!p.ready) return room.pool;
+  if (!p.ready) return room.pool;      // 读不到就别动 room.pool，也别让 savePool 拿它去覆盖存档
+  room.poolLoaded = true;              // 只有真读回来过，之后才允许落盘（见 savePool）
   room.pool = p.pool;
   // 每人的本局分也跟着主播恢复（跨重启/换机都在）
   if (p.rounds) for (const id in p.rounds) R.local(room, id).round = +p.rounds[id] || 0;
