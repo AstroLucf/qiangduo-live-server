@@ -161,12 +161,17 @@ async function liveDataCallback(headers, rawBody) {
   const roomId = headers['x-roomid'] || headers['x-room-id'] || (items[0] && items[0].room_id) || '';
   const rm = rooms.anchorOfRoomId(roomId) ? rooms.byRoom(roomId)
            : rooms.get(anchorOpenId || rooms.DEFAULT_ANCHOR);
+  // ★下行目标必须跟【已按 room_id 认领到的房】走，不能用全局 lastAnchorOpenId：
+  //   内网回调头常不带 x-anchor-openid（见上）→ anchorOpenId 会回退成「最近一次开局的主播」。
+  //   几个主播同播时，A 房的礼物就会被 pushToClient 下发到最后开局的 B 的客户端 —— 特效串进别人的直播间。
+  //   rm 已经按 room_id 认对了房，直接用它的 anchor 下行；只有认不出房(兜底)时才退回 anchorOpenId。
+  const dlOpenId = (rm.anchor && rm.anchor !== rooms.DEFAULT_ANCHOR) ? rm.anchor : anchorOpenId;
   for (const item of items) {
-    const events = dy.translate(msgType, item, cfg.DEFAULT_SIDE, rm.side);   // → [{side,key,count}]
+    const events = dy.translate(msgType, item, cfg.DEFAULT_SIDE, rm.side, { seen: rm.fansSeen, pending: rm.fansPending, active: rm.active });   // → [{side,key,count}]
     for (const ev of events) ledger.record(rm, ev);                   // 玩法积分入账（唯一真源，与 dev 的 /cb/* 同一口径）
     if (events.length) {
-      log('→ 翻译', JSON.stringify(events), '下行至', anchorOpenId ? (anchorOpenId.slice(0, 10) + '…') : '⚠️无openid(不下行)');
-      await pushToClient(anchorOpenId, item.msg_id, msgType, JSON.stringify(events));
+      log('→ 翻译', JSON.stringify(events), '下行至', dlOpenId ? (dlOpenId.slice(0, 10) + '…') : '⚠️无openid(不下行)');
+      await pushToClient(dlOpenId, item.msg_id, msgType, JSON.stringify(events));
     } else {
       log('→ 翻译为空 type=' + msgType + ' gift_id=' + (item.sec_gift_id || '-') + ' val=' + (item.gift_value || item.diamond || '-') + '(礼物没置顶映射? 或未选队且 DEFAULT_SIDE=ignore?)');
     }
