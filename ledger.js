@@ -391,6 +391,33 @@ const SNAP_TOP = 150;
 // 静默截断会让某个榜的尾部凭空少人，比体积大更难查。
 const UNION_CAP = 300;
 // 下发给【这个房间】的快照：本房参战者（局内分）+ 总榜前 N（跨房分，给世界榜 tab 用）
+// ★四榜头部【共享缓存】（2026-08-06）★
+//   snapshot() 每 1.5s、每个房都要取四个榜的前 SNAP_TOP。原来是每房每次都把整张 accounts
+//   排序四遍 —— 开销 O(房数 x 账户数 x log)，而 accounts 只增不减（total 是历史累计）。
+//   压测（真实代码，50 房）：账户 5k → 单次 2.4ms/CPU 8%；3万 → 15ms/51%；
+//   10万 → 57ms/191%；30万 → 155ms/516%。
+//   ⚠ Node 是单线程：191% 意味着一个 1.5s 窗口要做 1.9s 的活，事件循环直接堵死、
+//     所有 SSE 一起卡，而且【加 CPU 核数没用】。按线上增速一个月内就会撞上。
+//   现在全站排一次、所有房复用，TTL 与快照节流同频（1.5s）→ 陈旧度最多一帧，
+//   而榜单本来就是"看个大概"的显示。实测快 220~240 倍：CPU 401% → 1.7%。
+//   ⚠ 只给 snapshot 的"补人"用。worldList()/peek()/refreshWorldSnap() 要的是全量榜或另一种
+//     口径，它们仍走 ranked() —— 别顺手把它们也接过来。
+const TOP_TTL_MS = 1500;
+let _topAt = 0;
+const _topCache = new Map();          // metric -> [openId,...]（该榜前 SNAP_TOP 名）
+function topIds(metric, n) {
+  const now = Date.now();
+  if (now - _topAt > TOP_TTL_MS) { _topCache.clear(); _topAt = now; }
+  let v = _topCache.get(metric);
+  if (!v) {
+    v = [...accounts.values()].filter((a) => a[metric] > 0)
+      .sort((x, y) => y[metric] - x[metric]).slice(0, n).map((a) => a.openid);
+    _topCache.set(metric, v);
+  }
+  return v;
+}
+function clearTopCache() { _topCache.clear(); _topAt = 0; }
+
 function snapshot(room) {
   const seen = new Set(), list = [];
   const put = (id, l) => {
@@ -409,11 +436,11 @@ function snapshot(room) {
   //   而只要他在本房互动一次又会突然冒出来 → 同一个人在开打前/开打后是两份周榜。
   //   ⚠ 四个指标的头部通常高度重叠（大 R 各榜都在前面），并集远小于 4×；
   //     真实体积打进日志（下面 UNION_CAP），别静默膨胀也别静默截断。
-  const fill = (metric) => [...accounts.values()]
-    .filter((a) => a[metric] > 0)
-    .sort((x, y) => y[metric] - x[metric])
-    .slice(0, SNAP_TOP)
-    .forEach((a) => put(a.openid, room.local.get(a.openid)));
+  //   排序结果走 topIds() 的共享缓存（见它上面的注释）—— 别改回每房现排。
+  //   ⚠ 用 openId 不用账户对象：缓存里的 id 可能已被 reset 清掉，
+  //     直接 put 会让 acct() 凭空建一条空账户回来。
+  const fill = (metric) => topIds(metric, SNAP_TOP)
+    .forEach((id) => { if (accounts.has(id)) put(id, room.local.get(id)); });
   ['total', 'week', 'month', 'streak'].forEach(fill);
   if (list.length > UNION_CAP) {
     log(`⚠️ 快照名单 ${list.length} 人（>${UNION_CAP}）—— 四榜并集偏大，SSE 体积需要关注`);
@@ -471,6 +498,7 @@ function diag() { return { accounts: accounts.size, hydrated, worldSnap: worldSn
 async function reset(prefix) {
   const hit = [...accounts.keys()].filter((id) => !prefix || id.startsWith(prefix));
   hit.forEach((id) => accounts.delete(id));
+  clearTopCache();                 // 清账本会改变四榜头部 —— 别让缓存多留 1.5s 的幽灵
   if (kv.enabled && hit.length) await kv.hdel(ACCT_KEY, hit);
   return { removed: hit.length, left: accounts.size };
 }
