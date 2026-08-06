@@ -87,8 +87,16 @@ function refreshWorldSnap(why) {
 }
 
 function log(...a) { console.log('[ledger]', ...a); }
-const weekKey = (d) => { d = d || new Date(); const t = new Date(d); t.setDate(t.getDate() - ((t.getDay() + 6) % 7)); return t.getFullYear() + '-' + (t.getMonth() + 1) + '-' + t.getDate(); };
-const monthKey = (d) => { d = d || new Date(); return d.getFullYear() + '-' + (d.getMonth() + 1); };
+// ── 周/月边界：一律按【北京时间】算（2026-08-07 用户定）──
+// ⚠ 绝不能用本地时区：抖音云容器是 UTC（Dockerfile 没设 TZ，node:16-alpine 默认 UTC），
+//   于是换周点落在北京时间【周一早 8 点】，而规则要的是「周日 23:59:59 重置」—— 晚了 8 小时，
+//   周日深夜到周一早上刷的分会记到上一周。
+//   做法：把时间戳整体 +8h 再用 UTC 方法读，这样无论容器时区是什么，结果都是北京时间的年月日。
+const BJ_OFFSET_MS = 8 * 3600 * 1000;
+const bjTime = (d) => new Date((d ? d.getTime() : Date.now()) + BJ_OFFSET_MS);
+// 周键 = 本周【周一】的北京日期（周日 23:59:59 仍属上周，周一 00:00 换新周 —— 与规则一致）
+const weekKey = (d) => { const t = bjTime(d); t.setUTCDate(t.getUTCDate() - ((t.getUTCDay() + 6) % 7)); return t.getUTCFullYear() + '-' + (t.getUTCMonth() + 1) + '-' + t.getUTCDate(); };
+const monthKey = (d) => { const t = bjTime(d); return t.getUTCFullYear() + '-' + (t.getUTCMonth() + 1); };
 
 // ⚠ streak 和 winStreak 是两个东西，别合并：
 //   streak    = 玩法的【连胜池分】——败方各失 50% 汇池、胜方前 3 按 50/30/20 瓜分，是可转移的分数；
@@ -161,8 +169,42 @@ async function hydrate() {
   //   而且再没有任何机会补救。先落盘再打标记：flush 失败就不打标记，下次启动重试。
   if (wReset || mReset || migrated) { accounts.forEach((_, id) => _dirty.add(id)); await flush(); await stampMeta(); }
   else await stampMeta();
+  _curWk = wk; _curMk = mk;   // 记下当前周期，交给下面的运行中检查接着盯
   refreshWorldSnap('启动');   // ★服务端一起来就有榜 —— 这条专治「第一局不播」
 }
+
+// ★运行中的跨周/跨月检查（2026-08-07 加）★
+//   原来周月清零【只在 hydrate 里判一次】，没有任何定时器。后果不是「不清」，是【丢分】：
+//     ① 运行中的实例跨了周也不清，新赚的分继续累加进【同一个 week 字段】；
+//     ② 等实例被回收、新实例 hydrate，才发现 meta.wk 过期 → 把整个 week 清零
+//        —— 连同跨周之后新赚的那部分一起抹掉。
+//   已实测：Redis 里 w=250000（上周 5 万 + 跨周后新赚 20 万）→ 新实例 hydrate 后写回 w=0。
+//   抖音云 prod 实例几分钟回收一次，所以「周一早上赚的分下一次回收就没了」是常态。
+//   现在改成到点就清：跨界那一刻清零，之后赚的分属于新周期，不会再被误清。
+let _curWk = null, _curMk = null;
+function rollCheck() {
+  if (!hydrated || _curWk === null) return;      // 还没 hydrate 完就不动，避免拿空表去清
+  const wk = weekKey(), mk = monthKey();
+  let changed = false;
+  if (wk !== _curWk) {
+    accounts.forEach((a) => { a.week = 0; });
+    log(`⏰ 跨周（${_curWk} → ${wk}·北京时间）→ 周榜清零 ${accounts.size} 人`);
+    _curWk = wk; changed = true;
+  }
+  if (mk !== _curMk) {
+    accounts.forEach((a) => { a.month = 0; a.streak = 0; a.winStreak = 0; });
+    log(`⏰ 跨月（${_curMk} → ${mk}·北京时间）→ 月榜/连胜清零 ${accounts.size} 人`);
+    _curMk = mk; changed = true;
+  }
+  if (changed) {
+    accounts.forEach((_, id) => _dirty.add(id));
+    flush().then(stampMeta).catch(() => {});      // 立刻落盘 + 打新周期标记，别等下次 flush
+    refreshWorldSnap('跨周期重置');                // 入场名次档位跟着新周期走
+  }
+}
+// 每分钟看一眼；边界误差 < 1 分钟，够用。PK_ROLL_MS 只为自测能加速跑，生产不设。
+const _rollTimer = setInterval(rollCheck, Number(process.env.PK_ROLL_MS) || 60000);
+if (_rollTimer.unref) _rollTimer.unref();
 // ★存量单位迁移：票 → 分（2026-08-03 一次性）★
 //   2026-08-03 之前账本按"票"记账（仙女棒=1、药丸=10…），展示层再 ×1000 变成分；
 //   现在内部直接存分，存量必须整体 ×1000 才能和新数据同量纲，否则老用户的分会显得只有新用户的千分之一。
