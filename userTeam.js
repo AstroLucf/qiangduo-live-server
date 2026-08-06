@@ -102,7 +102,7 @@ function audienceChange(rawBody, broadcast, worldRankOf, room) {
   const isEnter = !act || /enter|join|in\b|come/.test(act);
   if (openId && isEnter && typeof broadcast === 'function' && typeof worldRankOf === 'function') {
     const testMode = RANK_ENTER_TEST >= 1 && RANK_ENTER_TEST <= RANK_ENTER_MAX;
-    const rank = testMode ? RANK_ENTER_TEST : worldRankOf(openId);   // 测试开关开 → 强制名次；否则真查世界榜
+    const rank = testMode ? RANK_ENTER_TEST : worldRankOf(openId, room);   // 测试开关开 → 强制名次；否则查【上局冻结】世界榜
     // 诊断：每个进场者的世界榜名次一眼可见（未上榜/非前百/触发 都打出来，方便排查为啥不播）
     console.log(`[room→] 进场 openid=${String(openId).slice(0, 10)}… 名次=${rank || '未上榜(需先送礼累计)'}${testMode ? '(测试强制)' : ''} ${rank >= 1 && rank <= RANK_ENTER_MAX ? '→ 触发榜' + rank + '入场视频' : '(非前百·不播)'}`);
     if (rank >= 1 && rank <= RANK_ENTER_MAX) {
@@ -162,16 +162,16 @@ function noteInteraction(user, broadcast, worldRankOf, isGift, isJoin, room) {
   //   点赞/666/闲聊一律不查：既不是落座、也不改名次，查了纯属浪费（worldRankOf 要全表排序）。
   if (!isJoin && !isGift) return;
   const testMode = RANK_ENTER_TEST >= 1 && RANK_ENTER_TEST <= RANK_ENTER_MAX;
-  const rank = testMode ? RANK_ENTER_TEST : worldRankOf(openId);
+  const rank = testMode ? RANK_ENTER_TEST : worldRankOf(openId, room);   // 查【上局结算冻结】的世界榜，非实时
   const now = Date.now();
   const cooling = !testMode && now - (COOL(room).get(openId) || 0) <= RANK_ENTER_COOLDOWN_MS;
   const ok = rank >= 1 && rank <= RANK_ENTER_MAX && !cooling;
   // ★先把结论算出来再打日志：别写成「打完『→ 触发』再 return」——那样日志会谎报触发（2026-08-01 自测抓到）。
-  const verdict = !(rank >= 1 && rank <= RANK_ENTER_MAX) ? '(未上榜·不播·送礼后会再查)'
+  const verdict = !(rank >= 1 && rank <= RANK_ENTER_MAX) ? '(上局结算榜未上榜·不播·本局送礼要下一局才进榜)'
                 : cooling ? `(榜${rank}·但 ${Math.round(RANK_ENTER_COOLDOWN_MS / 1000)}s 内已播过·跳过)`
                 : `→ 触发榜${rank}入场视频`;
   if (first || ok || cooling) {   // 无名次的后续送礼不再刷屏，只在首次/有结果时打
-    console.log(`[enter] 落座 openid=${String(openId).slice(0, 10)}… 名次=${rank || '未上榜(世界榜=送礼累计·本实例重启后清零)'}${testMode ? '(测试强制)' : ''} ${verdict}`);
+    console.log(`[enter] 落座 openid=${String(openId).slice(0, 10)}… 名次=${rank || '未上榜(按上局结算冻结榜·首局/重启后首局无榜)'}${testMode ? '(测试强制)' : ''} ${verdict}`);
   }
   if (!ok) return;
   // ★★记账放在【确认要播之后】：早期版本无条件 add，导致「先点赞(无名次)后送礼(有名次了)」的人

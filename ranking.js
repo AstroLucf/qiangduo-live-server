@@ -138,7 +138,7 @@ function uploadable(list, what) {
 // ★口径 = 账本的 total（总积分），与玩法里「世界榜」的定义、结算面板那个 tab 完全一致。
 // ★不再受 ENABLED(APPSECRET) 门控：入场视频是玩法自己的表现，不该因为没配 secret 就整个失灵
 //   —— 旧代码那个门控是因为名次算在上报模块里，属于历史耦合。
-function worldRankOf(openId) { return ledger.rankOfTotal(openId); }
+function worldRankOf(openId, room) { return ledger.rankOfTotal(openId, room); }
 
 // 用户快捷选队②:上报观众阵营(gaming_con/round/upload_user_group_info·观众加入阵营时调)。
 // group_id=side(left/right·与后台 Group_ID 一致);round_id 取当前对局(无则 nowSec 兜)。无 secret 静默降级。
