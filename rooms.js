@@ -67,7 +67,17 @@ function blank(anchor) {
     pool: 0,                           // 本局积分池（含上一局结转来的底池）
     poolOpen: false,                   // 本局是否还没结转
     poolLoaded: false,                 // 底池是否已从存档成功读回；false 时禁止落盘（见 ledger.savePool）
-    side: new Map(),                   // openId -> 'left'|'right'  落座锁（每局清）
+    // exe（重新）启动过 → 下一次 /round/start 当【真开新局】处理（重读底池 + 清落座 + 清本局账）。
+    // ⚠ 显式初始化成 false，别留 undefined：/round/start 的 freshRound 判据要拿它算，
+    //   undefined 会让 `!room.active || room.needReload` 整体算成 undefined。
+    needReload: false,
+    // 落座锁（每局清）。value 是对象不是字符串：{ side:'left'|'right', how:'auto'|'pick' }
+    //   how='auto' 系统随机给的(送礼哈希) → 还能被一次显式选队纠正
+    //   how='pick' 观众自己指定的(弹幕1/2·原生选队·小摇杆) → 本局锁死
+    // ⚠ how 寄生在 value 里是刻意的：clearRound 的 r.side.clear() 与 douyin.clearSides()
+    //   都是整表 clear，how 跟着一起没。【别另开一张 explicit 表】——那要在这里建、
+    //   在 clearRound 清、还要给 clearSides 加参数，而 douyincloud.js 那条只传了一个参数。
+    side: new Map(),
     entered: new Set(),                // 本局已播过入场视频的 openId
     seen: new Set(),                   // 本局出现过的 openId（判首次）
     cooldown: new Map(),               // openId -> ts  入场视频跨局去抖

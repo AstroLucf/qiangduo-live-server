@@ -54,13 +54,35 @@ function giftToKey({ sec_gift_id, diamond }) {
 //   现在每个房间自带一份（见 rooms.js 的 room.side），调用时作为最后一个参数传进来。
 //   ⚠ 不传 = 退回下面这份模块级兜底表：本地调试、自查工具、老版本 exe 都走它，
 //     行为与改造前完全一致，所以这次改造对它们零影响。
-const userSide = new Map();                   // sec_openid -> 'left' | 'right'（兜底表）
+// sec_openid -> { side:'left'|'right', how:'auto'|'pick' }（兜底表）
+//   how = 这个座位【是怎么来的】：
+//     'auto' 系统随机给的（送礼哈希落座，观众没表过态）—— 还能被一次显式选队纠正
+//     'pick' 观众自己指定的（弹幕1/2 · 原生选队 · 小摇杆）—— 本局锁死，谁也改不动
+//   ★2026-08-06 从裸字符串改成对象：落座表原来只存边、存不下「怎么落的座」，
+//     那正是「先扣1再扣2能换队」这个 bug 的数据结构层根因。
+//   how 寄生在 value 里是刻意的 —— 两条清表路（clearSides / rooms.clearRound 的 r.side.clear()）
+//   都是整表 Map.clear()，how 跟着 value 一起没，新增清理点 = 0。
+//   ⚠ 别改成「另开一张 explicit 表」：那要在 rooms.blank() 建、clearRound 清、clearSides 加参数，
+//     而 douyincloud.js 那条 clearSides 只传了一个参数 —— 漏它 = 主播重开 exe 后观众整局选不了队。
+const userSide = new Map();
 const M = (sides) => (sides instanceof Map ? sides : userSide);
-function setSide(openid, side, sides) {
-  if (openid && (side === 'left' || side === 'right')) M(sides).set(openid, side);
+// 读座位对象。裸字符串（导出的 setSide 后门写进来的旧格式）一律当 'auto' ——
+// 保守方向：最坏是「还能被纠正一次」，绝不会把人永久钉死在他没选过的队。
+function seatOf(openid, sides) {
+  const v = openid ? M(sides).get(openid) : null;
+  if (!v) return null;
+  return (typeof v === 'string') ? { side: v, how: 'auto' } : v;
 }
-// 查该用户【主动选过】的队(评论1/2 · 原生选队)；没选过返回 ''(纯探测,绝不触发随机落座)
-function chosenSide(openid, sides) { return (openid && M(sides).get(openid)) || ''; }
+function setSide(openid, side, sides, how) {
+  if (openid && (side === 'left' || side === 'right')) {
+    M(sides).set(openid, { side, how: how === 'pick' ? 'pick' : 'auto' });
+  }
+}
+// 查该用户已落座的队；没落座返回 ''(纯探测,绝不触发随机落座)
+// ★返回值仍是字符串 ''|'left'|'right' —— 全服务端读落座表只有这一条路
+//   （translate 的三个只读门禁、sideOf、userTeam 的 queryUserGroup 都走它），
+//   保住它的返回类型 = 下游零改动。
+function chosenSide(openid, sides) { const s = seatOf(openid, sides); return (s && s.side) || ''; }
 // 给一次互动定边：主动选过 → 那边；否则 DEFAULT_SIDE 指定 left/right → 固定；否则「随机落座」(哈希,没选队也参与、不丢弃)
 function sideOf(openid, fallback, sides) {
   const chosen = chosenSide(openid, sides);
@@ -78,29 +100,44 @@ function hashSide(openid) {
 }
 // 匿名(无 openid)落座：当次随机，无法追踪到人 → 不锁、每次重算。
 function randSide() { return Math.random() < 0.5 ? 'right' : 'left'; }
-// —— 落座锁定(2026-06-30) ——
-// 规则：首次互动即【落座并锁死本局】——评论1/2按方向、礼物随机定边；
-// 之后该用户【任何】互动都归这一队、本局内永不改(再喊别的队也不换)。
-// ★2026-08-05 起【只有礼物】会走这条隐式落座：点赞和 666/6/66 已改成「只读不写」，
-//   没下场的人刷这两样一律不下发（见 translate 的 live_like / cheer 分支）。用户定。
-// 开局 clearSides() 清空 → 下一局重新拉队。匿名无身份 → 每次随机、不锁。
-// 这是「随机落座与1/2选队地位相同、一旦落座不得修改」的服务端唯一真源(替代会覆盖的 setSide)。
-// ★2026-08-03 改（用户报「弹幕扣1去了2」）：显式意愿可以改队，隐式落座才锁死。
-//   原来 prefer 参数被整个忽略 —— 观众只要在扣「1」之前点过一次赞，就已被 hashSide 随机落座，
-//   之后再明确扣「1」只会被退回原队。表现就是「我明明扣了1，却被分到小美队」。
-//   现在分两类：
-//     · 隐式落座（礼物/点赞/666）→ 一旦落座本局不再变（防同一个人来回横跳刷两边推力）
-//     · 显式意愿（评论1/2 · 原生选队 · 小摇杆选队）→ 允许改队，观众说了算
-//   ⚠ explicit 只能由「观众主动指定阵营」的入口传 true。礼物/点赞传的是 DEFAULT_SIDE，
-//     那不是意愿、是兜底，绝不能当显式——否则 DEFAULT_SIDE 一配就把所有人反复拽到同一边。
+// —— 落座锁定 ——
+// 【现行规则·2026-08-06】
+//   · 观众【自己指定】的队（弹幕1/2 · 原生选队 · 小摇杆）→ 落座即【锁死本局】，之后谁也改不动。
+//   · 仅剩的一条隐式落座（送礼哈希随机）→ 还能被【一次】显式选队纠正，纠正完随即升级为锁死。
+//   · 已锁死的人再喊 1/2 → 不换队，但照常给【原队】加力（translate 产出 c666，不是丢弃）。
+//   开局 clearSides() 清空 → 下一局重新拉队。匿名无身份 → 每次随机、不锁。
+//   这是落座锁的服务端唯一真源（替代会直接覆盖的 setSide）。
+//
+// 【三次翻转的由来·别再来回改】
+//   2026-06-29 ec6c1f3：真机吐槽「喊1选左后喊2切不到右」→ 一度放开。
+//   2026-06-30 42b3bd5：次日推翻，定为「首次即定队、本局锁死不换」（防来回横跳刷两边推力）。
+//   2026-08-03 f30f47f：用户报「弹幕扣1去了2」→ 开了「显式意愿可改队」的口子。
+//     当时的真根因是：点赞会隐式随机落座，观众点过赞再扣「1」只会被退回原队。
+//   2026-08-05 7f65a46：点赞和 666 改成「只读不写」，不再落座 —— ★上面那个根因就此消失★，
+//     但「显式可改队」留着没收，副作用是「先扣1再扣2能换队」，而且触发面远不止 1/2：
+//     LEFT_RE/RIGHT_RE 匹配面很宽，一句「帮小美」就能把人从大壮队拽走。
+//   2026-08-06（本次）：收掉那个口子 —— 恢复 06-30 的决定，只保留「隐式→显式一次纠正」。
+//     ⚠ 那一次纠正【必须保留】：hashSide 是确定性哈希，同一 openid 每局落同一边，
+//       而点赞/666 已不能落座 —— 全禁的话，只靠送礼的观众会每一局都被钉在没选过的队、
+//       毫无自救手段，最后错的是 ledger 按胜负方分钱。
+//
+// ⚠ explicit 只能由「观众主动指定阵营」的入口传 true。礼物传的是 DEFAULT_SIDE，
+//   那不是意愿、是兜底，绝不能当显式——否则 DEFAULT_SIDE 一配就把所有人反复拽到同一边。
+//   本函数【复用现有的 explicit 参数】推导 how，签名刻意不动：四条注入路
+//   （douyin.js 的 live_gift/live_comment/team_select + userTeam.js 的小摇杆）一行都不用改，
+//   漏改机会 = 0。
 function lockSide(openid, prefer, explicit, sides) {
-  const chosen = chosenSide(openid, sides);
+  const seat = seatOf(openid, sides);
   const wants = (prefer === 'left' || prefer === 'right');
-  if (chosen && !(explicit && wants)) return chosen;           // 已落座且非显式改队 → 归原队
-  const side = (prefer === 'left' || prefer === 'right')
-    ? prefer                                                  // 评论1/2/原生选队：按方向落座
-    : (openid ? hashSide(openid) : randSide());               // 礼物/点赞/666：有身份哈希随机、匿名当次随机
-  if (openid) setSide(openid, side, sides);                   // 有身份才能锁(匿名无法追踪到人)
+  // ★唯一允许改边的情形：座位是系统随机给的(how==='auto') 且 观众这次明确指定了队。
+  //   已经是 'pick' 的 → 无条件归原队，这就是「先扣1再扣2不换」。
+  if (seat && !(explicit && wants && seat.how === 'auto')) return seat.side;
+  const side = wants
+    ? prefer                                                  // 评论1/2/原生选队/小摇杆：按方向落座
+    : (openid ? hashSide(openid) : randSide());               // 送礼：有身份哈希随机、匿名当次随机
+  // 显式指定 → 记 'pick' 并锁死。★同边也升级★：送礼恰好落对队、观众再扣「1」确认，
+  //   同样要升级成 pick —— 否则他之后还能扣「2」换走，bug 原样复发。
+  if (openid) setSide(openid, side, sides, (explicit && wants) ? 'pick' : 'auto');
   return side;
 }
 // 开局清空落座记录 —— 配合「每局重新拉队」：上一局的落座不跨局残留。

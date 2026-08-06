@@ -239,7 +239,7 @@ function record(room, ev) {
 }
 
 // ── 对局生命周期 ──
-function startRound(room, anchorOpenId) {
+function startRound(room, anchorOpenId, freshRound) {
   // ⚠ 绝不就地改写 room.anchor：房间的身份是 rooms 的【Map 键】，改这里键不会跟着变，
   //   会造出「兜底房顶着真实主播的名字」和「同一 anchor 两个 room 对象」。调用方负责取对房。
   //   只在房还没有身份时补一次（正常不会发生），不一致就告警，别静默走下去。
@@ -248,7 +248,15 @@ function startRound(room, anchorOpenId) {
     else log(`⚠️ anchor 不一致：房=${String(room.anchor).slice(0, 10)}… 传入=${String(anchorOpenId).slice(0, 10)}… → 以房为准`);
   }
   room.active = true;
-  R.clearRound(room);              // 只清【本房】局内：fresh/likes/gifts/side + 落座表 + 入场去重
+  // ★freshRound === false 才跳过清局内账（2026-08-06）★
+  //   clearRound 清的是 fresh/likes/gifts/side + 落座表 + 入场去重 —— 局中被重复调一次
+  //   就等于把观众本局刷的分全抹成 0，而底池里那笔钱还在（loadPool 早就守住了），
+  //   结算时他一分拿不到、钱分给别人。实测 6000 → 0。
+  //   判据由调用方(index.js 的 /round/start)算好传进来，与它守 loadPool 用的是【同一个】，
+  //   两处必须同源：只守一处完全无效，因为这里和那里各清一遍落座表。
+  //   ⚠ 不传（老调用 / 自查工具 / 本地脚本）→ 照旧清，行为与改造前完全一致。
+  if (freshRound !== false) R.clearRound(room);
+  else log(`/round/start 重复调用 → 跳过 clearRound，保住本局账（${room.local.size} 人）`);
   savePool(room);
 }
 // 结算：完全照搬 src/score.js 的 settle()，逐条对齐（改任何一条两边一起改）
@@ -435,7 +443,9 @@ function roundList(room) {
                             rank: Math.min(i + 1, RANK_CAP) }));
 }
 function worldList() { return ranked('month'); }
-// 入场视频的名次【按局冻结】—— 结算(settle)时把当时的榜定格一份，本局进行中送礼【不即时改档】。
+// 入场视频的名次：读【全平台一份】的冻结榜 worldSnap（启动即建 + 任意主播 settle 刷新）。
+// ⚠ 不是「按局冻结」了：任意主播结算都会刷同一份全局榜 —— A 房局中，B 房一结算 A 房观众的档位也可能变。
+//   仍然成立的是「本局刚打的分不立刻升档」（要等某次 settle）。
 // 口径 = 周榜/月榜/总分榜三者里【最靠前】的那个名次（见 refreshWorldSnap 上方的说明）：
 //   ① 三个榜都没上（total=0）→ 0，不播；② 按排序序位给名次，同分也落不同档
 //   （不像旧的严格 `>` 计数那样把同分全并成「榜一」→ 一堆人共用同一条入场视频）。

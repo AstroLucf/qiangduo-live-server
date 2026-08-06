@@ -402,23 +402,42 @@ const server = http.createServer(async (req, res) => {
     const roomId = body.room_id || room.roomId;
     const anchor = room.anchor;
     if (path === '/round/start') {
-      dy.clearSides(room.side); ut.resetRoundEnter(room); rank.startRound(roomId, anchor);
-      // ★只在【不在局中】时才从存档读底池（2026-08-05 线上抓到）★
-      //   loadPool 会 `room.pool = 存档值`。存档是在【上一次开局那一刻】写的，
-      //   所以局中再来一次 /round/start（主播重复点开始 / exe 重连重发 / reset），
-      //   会把本局观众已经刷进去的钱整个抹掉 —— 实测 521000 → 0，钱凭空消失。
-      //   本局已经在跑就说明底池早已恢复过，没有再读一次的理由。
+      // ★「这是真的开新局」还是「局中被重复调了一次」——判据只有这一个，下面【六个动作】共用★
       //   区分两种「active 仍是 true 时的开局」：
-      //     (a) 同一次 exe 会话里重复发 /round/start（主播重复点、客户端重发）→ 不能重读，会抹掉本局的钱
-      //     (b) 主播结算面板开着就关了 exe、隔一会儿回来重开 → 必须重读并补那次 40% 折
+      //     (a) 同一次 exe 会话里重复发 /round/start（主播重复点、客户端重发、reset）→ 不是新局
+      //     (b) 主播结算面板开着就关了 exe、隔一会儿回来重开 → 是新局，且必须补那次 40% 折
       //   两者的区别是 (b) 一定先走过 /start_game —— 用它打的 needReload 标记来分。
-      if (!room.active || room.needReload) await ledger.loadPool(room, anchor);
-      else console.log(`[rooms] /round/start 重复调用（本局仍在进行、且没重新 /start_game）→ 跳过 loadPool，保住已攒的 ${room.pool}`);
+      //
+      //   ⚠️ 2026-08-05 只用这个判据守住了 loadPool（底池），其余五个动作【全都没守】——
+      //     同一个病根只修了一半。2026-08-06 实测局中重复点开始的后果：
+      //       底池 8000 → 8000  ✓（守住了）
+      //       本局分 6000 → 0   🔴 观众刷的分归零，钱还在底池里，结算时全分给别人 —— 这是钱
+      //       阵营 left → null  🔴
+      //       落座锁 → 清空     🔴 观众能重新选队，且下一条事件 key=join 不是 c666，
+      //                            客户端 joinedPerm 又会把它拦掉 → 服务端计分、客户端不给推力，两边分叉
+      //       入场去重 → 清空   🔴 榜1入场视频重播
+      //       平台 round_id → 重置 🔴 这一局在平台侧分裂成两个 round，前半段那个永远收不到 end
+      // ⚠ 必须是【严格 boolean】：room.needReload 在房刚建出来时是 undefined，
+      //   `false || undefined` = undefined，传给 ledger.startRound 后它的 `!== false`
+      //   会判成「要清」——两处判据口径不一致，本局账照样被抹。2026-08-06 自测抓到。
+      const freshRound = !room.active || !!room.needReload;
+      if (freshRound) {
+        dy.clearSides(room.side);          // 落座锁：清了观众就能重新选队
+        ut.resetRoundEnter(room);          // 入场去重：清了入场视频会重播
+        rank.startRound(roomId, anchor);   // 平台上报 + 重置 round_id（ranking.js:176-177）
+        await ledger.loadPool(room, anchor);
+      } else {
+        console.log(`[rooms] /round/start 重复调用（本局仍在进行、且没重新 /start_game）→ `
+          + `六项全部跳过：落座锁/入场去重/平台round_id/底池(${room.pool})/本局账/局号`);
+      }
       room.needReload = false;
-      ledger.startRound(room, anchor);
-      room.round = { id: (room.round ? room.round.id : 0) + 1, status: 1 };   // 局号也按房，别再用全局
-      pushLedger(room, true);
-      return json(res, 200, { ok: true, roomId, roundId: room.round.id, pool: ledger.snapshot(room).pool });
+      ledger.startRound(room, anchor, freshRound);   // freshRound=false → 内部不跑 clearRound，保住本局账
+      // 局号只在真开新局时 +1：重复调用会让局号虚涨，客户端拿它做本局标识
+      if (freshRound) room.round = { id: (room.round ? room.round.id : 0) + 1, status: 1 };
+      else if (room.round) room.round.status = 1;
+      pushLedger(room, true);              // 无论如何都推一次：客户端重发多半就是因为它状态丢了
+      return json(res, 200, { ok: true, roomId, roundId: room.round ? room.round.id : 0, fresh: freshRound,
+                              pool: ledger.snapshot(room).pool });
     }
     const winner = body.winner === 'left' || body.winner === 'right' ? body.winner : 'tie';
     // ★结算在服务端算：客户端拿这份结果直接渲染，两边不会各算各的。
