@@ -59,13 +59,30 @@ let hydrated = false;
 //       不是互相覆盖，所以「A 在看排名时 B 结算了」不会打架，只是榜更新了。
 //   ⚠ hydrated 之前【绝不】建榜：那时 accounts 还没从 Redis 读回来，
 //     排出来的是一份残缺榜，会让本该榜一的人播成榜五十。宁可这一小会儿不播。
+//
+//   ★★ 档位 = 三个榜里【名次最靠前】的那个（2026-08-05 用户定）★★
+//   用户原话：「哪个排名靠前，就播放哪个动画」，并给了三个例子：
+//       月榜3  周榜20        → 播 3（月榜）
+//       月榜20 周榜3         → 播 3（周榜）
+//       总分榜2 周榜月榜都3   → 播 2（总分榜）
+//   即：名次 = min(周榜名次, 月榜名次, 总分榜名次)，数值越小越靠前。
+//   ⚠ 某个榜【没上榜】的人不参与那个榜的比较 —— ranked(metric) 已经把该指标 =0 的人过滤掉了，
+//     所以周榜清零后（每周一）大家只靠月榜/总分榜争档位，不会被"周榜第 0 名"这种鬼值拉下去。
+//   ⚠ 三个榜都没有（total=0，纯新观众）→ 查不到 → 名次 0 → 不播。这条是设计如此，
+//     和「首局不播」不是一回事，别一起改掉。
+const ENTRY_METRICS = ['total', 'week', 'month'];   // 参与"取最靠前"的三个榜
 let worldSnap = null;
 function refreshWorldSnap(why) {
   if (!hydrated) return null;                    // 账本还没读回来 → 不建（宁可不播也别播错档）
   const m = new Map();
-  ranked('total').forEach((u) => m.set(u.openId, u.rank));
+  ENTRY_METRICS.forEach((metric) => {
+    ranked(metric).forEach((u) => {
+      const prev = m.get(u.openId);
+      if (prev === undefined || u.rank < prev) m.set(u.openId, u.rank);   // 取最小 = 最靠前
+    });
+  });
   worldSnap = m;
-  log(`入场名次榜已刷新 ${m.size} 人（${why}）`);
+  log(`入场名次榜已刷新 ${m.size} 人（${why}·三榜取最靠前 ${ENTRY_METRICS.join('/')}）`);
   return m;
 }
 
@@ -418,14 +435,17 @@ function roundList(room) {
                             rank: Math.min(i + 1, RANK_CAP) }));
 }
 function worldList() { return ranked('month'); }
-// 入场视频的名次【按局冻结】—— 每局结算(settle)时把当时的世界榜定格一份，本局进行中送礼【不即时改档】。
-// 口径同结算面板世界榜 ranked('total')：① 只收 total>0 的人（没积分不上榜）；② 按排序序位给名次，
-// 同分也落不同档（不再像旧的严格 `>` 计数那样把同分全并成「榜一」→ 一堆人共用同一条入场视频）。
+// 入场视频的名次【按局冻结】—— 结算(settle)时把当时的榜定格一份，本局进行中送礼【不即时改档】。
+// 口径 = 周榜/月榜/总分榜三者里【最靠前】的那个名次（见 refreshWorldSnap 上方的说明）：
+//   ① 三个榜都没上（total=0）→ 0，不播；② 按排序序位给名次，同分也落不同档
+//   （不像旧的严格 `>` 计数那样把同分全并成「榜一」→ 一堆人共用同一条入场视频）。
 
 // 查某人的【入场视频名次】(1-based)，不在榜返回 0（没积分不上榜 —— 用户确认这条是对的）。
+// ⚠ 原名 rankOfTotal 已废弃：2026-08-05 改成三榜取最靠前之后，那个名字会骗人
+//   （返回的不再是"总分榜名次"）。本项目栽在"名字/口径对不上"上不止一次，所以直接改名。
+//   下面仍导出 rankOfTotal 作别名，避免撞到并行会话在途的调用点。
 // ⚠ 第二个参数 room 已废弃：名次是全平台共享的，跟哪个直播间无关。
-//   形参留着只为不打断现有调用点（ranking.worldRankOf 两处、userTeam 两处），别再传新东西进来。
-function rankOfTotal(openId, _roomDeprecated) {
+function entryRankOf(openId, _roomDeprecated) {
   if (!openId) return 0;
   // 还没建过榜（hydrate 刚好慢一步）→ 补建一次，别让开播头几秒白白不播
   const snap = worldSnap || refreshWorldSnap('懒建');
@@ -447,5 +467,5 @@ async function reset(prefix) {
 
 module.exports = {
   record, startRound, settle, nextRound, snapshot, loadPool, ready, diag, reset, flush, INHERIT_RATE,
-  roundList, worldList, rankOfTotal, peek, size: () => accounts.size,
+  roundList, worldList, entryRankOf, rankOfTotal: entryRankOf, peek, size: () => accounts.size,   // rankOfTotal 是旧名别名，见 entryRankOf 上方
 };
