@@ -161,10 +161,28 @@ function addrOf(req) {
   if (xf) return String(xf).split(',')[0].trim();
   return (req.socket && req.socket.remoteAddress) || '';
 }
+// ★平台回调【绝不】退到「最近开局的主播」（2026-08-06 线上抓到）★
+//   roomOf 那条兜底链是给【客户端请求】用的：老包不带 token 时，退到"最近开局的主播"
+//   大概率就是它自己那台 exe，合理。但平台回调带的是 room_id ——
+//   认不出来只说明「这个主播还没 /start_game / 服务端重启过」，
+//   退到"最近开局的主播"等于把【真实主播甲的观众互动】灌进【主播乙的房】：
+//   乙的积分池涨甲的钱、乙的结算把甲的观众算进来分钱。正是多房隔离要防的事。
+//   线上实测：一个真实房间号 7670805039335459635 的回调被塞进了我刚开局的探针房。
+//   认不出来就落兜底房 —— 兜底房里各家仍会互串，但那是过渡期的隔离底线，
+//   比污染某个具体主播的账好得多。exe 下次 /start_game 就会重新绑对。
+function roomOfCb(u, req, body) {
+  const rid = (body && body.room_id) || (req && req.headers['x-roomid']) || '';
+  if (rid) {
+    const a = rooms.anchorOfRoomId(rid);
+    if (a) return rooms.get(a);
+    console.log(`[rooms] 回调 room_id=${rid} 认不出主播 → 落兜底房（该主播还没 /start_game 或服务端重启过）`);
+  }
+  return rooms.get(rooms.DEFAULT_ANCHOR);
+}
 function roomOfRaw(u, req, raw) {                      // 平台回调多为字符串 body（可能是数组）
   let b = {}; try { b = JSON.parse(raw || '{}'); } catch (_) {}
   if (Array.isArray(b)) b = b[0] || {};
-  return roomOf(u, req, b);
+  return roomOfCb(u, req, b);
 }
 const bcOf = (room) => (evs) => broadcast(room, evs);  // 交给 userTeam 的广播器：已绑定房间
 
@@ -315,7 +333,7 @@ const server = http.createServer(async (req, res) => {
     // ★路由到该 room_id 对应主播的房：落座表、积分池、入场去重、SSE 目标全部取本房的。
     //   认不出来（服务端重启过、exe 还没开局）→ roomOf 会退回「最近开局的主播」，
     //   与改造前单主播行为一致，观众的钱不会凭空消失。
-    const room = rooms.byRoom(roomId).anchor === rooms.DEFAULT_ANCHOR ? roomOf(u, req, items[0]) : rooms.byRoom(roomId);
+    const room = roomOfCb(u, req, items[0] || { room_id: roomId });   // 回调专用：认不出就落兜底房，不抢别人的房
     if (roomId) room.roomId = roomId;
     let events = [];
     for (const item of items) {
