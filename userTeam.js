@@ -51,7 +51,7 @@ function queryUserGroup(rawBody, round, sides) {
   };
 }
 
-// ④ 观众选择阵营（平台推·观众点选队按钮）：lockSide 落座（首次按选的方向锁定·已落座归原队不换）
+// ④ 观众选择阵营（平台推·观众点选队按钮）：lockSide 落座（首次按选的方向锁定并【锁死本局】·已选过队归原队不换）
 //    → 广播 join/c666 到游戏（首次=加入·永久推力+小火箭；已落座=加力）→ 返回实际加入阵营。
 function userGroupPush(rawBody, round, broadcast, worldRankOf, room) {
   const sides = room && room.side instanceof Map ? room.side : undefined;   // 本房落座表
@@ -63,7 +63,11 @@ function userGroupPush(rawBody, round, broadcast, worldRankOf, room) {
   if (!want) {
     return { errcode: 0, errmsg: 'success', data: { round_id: round.id || 0, round_status: round.status || 2, group_id: dy.chosenSide(openId, sides) || '' } };
   }
-  // 小摇杆点按钮 = 最明确的显式意愿 → explicit=true，允许改队（同评论 1/2，见 douyin.js 的 lockSide）
+  // 小摇杆点按钮 = 最明确的显式意愿 → explicit=true：首次落座并【锁死本局】。
+  // ★2026-08-06 起不再允许换队（同评论 1/2，见 douyin.js 的 lockSide 规则块）：
+  //   已经自己选过队的人再点按钮 → 归原队、只加力。仅「送礼被随机落座」的人还能靠这一下纠正一次。
+  //   ⚠ 回执 group_id 返回的是【实际生效的队】(下面 side)，可能与他点的不同 ——
+  //     平台 UI 拿到「点了B回A」怎么表现，官方文档没写，真机才知道。
   const prev = dy.chosenSide(openId, sides);
   const side = dy.lockSide(openId, want, true, sides);
   if ((side === 'left' || side === 'right') && typeof broadcast === 'function') {
@@ -102,7 +106,7 @@ function audienceChange(rawBody, broadcast, worldRankOf, room) {
   const isEnter = !act || /enter|join|in\b|come/.test(act);
   if (openId && isEnter && typeof broadcast === 'function' && typeof worldRankOf === 'function') {
     const testMode = RANK_ENTER_TEST >= 1 && RANK_ENTER_TEST <= RANK_ENTER_MAX;
-    const rank = testMode ? RANK_ENTER_TEST : worldRankOf(openId, room);   // 测试开关开 → 强制名次；否则查【上局冻结】世界榜
+    const rank = testMode ? RANK_ENTER_TEST : worldRankOf(openId, room);   // 测试开关开 → 强制名次；否则查【全平台一份】的入场名次榜（周/月/总三榜取最靠前，见 ledger.refreshWorldSnap）
     // 诊断：每个进场者的世界榜名次一眼可见（未上榜/非前百/触发 都打出来，方便排查为啥不播）
     console.log(`[room→] 进场 openid=${String(openId).slice(0, 10)}… 名次=${rank || '未上榜(需先送礼累计)'}${testMode ? '(测试强制)' : ''} ${rank >= 1 && rank <= RANK_ENTER_MAX ? '→ 触发榜' + rank + '入场视频' : '(非前百·不播)'}`);
     if (rank >= 1 && rank <= RANK_ENTER_MAX) {
@@ -162,16 +166,16 @@ function noteInteraction(user, broadcast, worldRankOf, isGift, isJoin, room) {
   //   点赞/666/闲聊一律不查：既不是落座、也不改名次，查了纯属浪费（worldRankOf 要全表排序）。
   if (!isJoin && !isGift) return;
   const testMode = RANK_ENTER_TEST >= 1 && RANK_ENTER_TEST <= RANK_ENTER_MAX;
-  const rank = testMode ? RANK_ENTER_TEST : worldRankOf(openId, room);   // 查【上局结算冻结】的世界榜，非实时
+  const rank = testMode ? RANK_ENTER_TEST : worldRankOf(openId, room);   // 查【全平台一份】的入场名次榜（周/月/总三榜取最靠前）；非实时：settle 才刷新
   const now = Date.now();
   const cooling = !testMode && now - (COOL(room).get(openId) || 0) <= RANK_ENTER_COOLDOWN_MS;
   const ok = rank >= 1 && rank <= RANK_ENTER_MAX && !cooling;
   // ★先把结论算出来再打日志：别写成「打完『→ 触发』再 return」——那样日志会谎报触发（2026-08-01 自测抓到）。
-  const verdict = !(rank >= 1 && rank <= RANK_ENTER_MAX) ? '(上局结算榜未上榜·不播·本局送礼要下一局才进榜)'
+  const verdict = !(rank >= 1 && rank <= RANK_ENTER_MAX) ? '(不在前100·不播·三榜都没上或本局刚打的分要等结算才进榜)'
                 : cooling ? `(榜${rank}·但 ${Math.round(RANK_ENTER_COOLDOWN_MS / 1000)}s 内已播过·跳过)`
                 : `→ 触发榜${rank}入场视频`;
   if (first || ok || cooling) {   // 无名次的后续送礼不再刷屏，只在首次/有结果时打
-    console.log(`[enter] 落座 openid=${String(openId).slice(0, 10)}… 名次=${rank || '未上榜(按上局结算冻结榜·首局/重启后首局无榜)'}${testMode ? '(测试强制)' : ''} ${verdict}`);
+    console.log(`[enter] 落座 openid=${String(openId).slice(0, 10)}… 名次=${rank || '未上榜(周/月/总三榜取最靠前·没积分不上榜)'}${testMode ? '(测试强制)' : ''} ${verdict}`);
   }
   if (!ok) return;
   // ★★记账放在【确认要播之后】：早期版本无条件 add，导致「先点赞(无名次)后送礼(有名次了)」的人
