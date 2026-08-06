@@ -77,7 +77,6 @@ function blank(anchor) {
     //   跟着房间(主播 openid)走，所以观众在 A 主播房领过，去 B 主播房加 B 的团照样会播。
     fansSeen: new Set(),               // 本场已播过加团表现的 openId
     fansPending: new Map(),            // 加团时还没下场的人 openId -> user，等他落座再补发
-    rankSnap: null,                    // 入场视频名次【按局冻结】快照 openId->名次：settle 时刷新，供【下一局】进场查档（不实时）
     local: new Map(),                  // openId -> {fresh, round, likes, gifts, side}  局内账
     lastSeen: Date.now(),
     tag: '',                           // SSE event id 前缀，见 byTag 注释；在 get() 里补上
@@ -183,7 +182,6 @@ function diag() {
       anchor: r.anchor === DEFAULT_ANCHOR ? r.anchor : r.anchor.slice(0, 12) + '…',
       roomId: r.roomId, clients: r.clients.size, active: r.active,
       pool: r.pool, players: r.local.size, seq: r.eventSeq,
-      rankSnap: r.rankSnap instanceof Map ? r.rankSnap.size : 0,   // 0 = 这房还没冻结过名次 → 入场特效必然不播
       poolLoaded: !!r.poolLoaded,
       idleMin: Math.round((Date.now() - r.lastSeen) / 60000),
     })),

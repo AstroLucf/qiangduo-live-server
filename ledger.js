@@ -44,6 +44,31 @@ const R = require('./rooms');
 const accounts = new Map();       // openId -> 跨房账户
 let hydrated = false;
 
+// ★入场特效名次 = 全平台【一份】冻结榜（2026-08-05 用户定）★
+//   用户原话：「榜单应该是共享的，每个主播共享的，譬如说 A 在榜单上是第 2 名，
+//   那么它去到哪一个直播间都需要播放第 2 名的入场特效，而不是说第一局不播」
+//   —— 所以它【不能】挂在 room 上。之前是 room.rankSnap（每个主播各存一份、各自在自己
+//   settle 时刷新），同一个观众在甲房和乙房会被认成不同名次，新主播房里还谁都不播。
+//   数据源 accounts 本来就是跨房全局的，拧的只是快照这一层。
+//
+//   刷新时机（用户选的 A 方案）：
+//     · hydrate 成功后【立刻】建一份 —— 这条专治「第一局不播」：服务端一起来就有榜，
+//       不用等谁打完一局。（并行会话把快照落盘到每个主播记录里也是为了治这个，
+//       根因解决后那套就多余了，见 loadPool 里的说明。）
+//     · 任意主播 settle 之后刷新 —— 多个主播同时在播时，谁结算都往同一本账里加自己那份，
+//       不是互相覆盖，所以「A 在看排名时 B 结算了」不会打架，只是榜更新了。
+//   ⚠ hydrated 之前【绝不】建榜：那时 accounts 还没从 Redis 读回来，
+//     排出来的是一份残缺榜，会让本该榜一的人播成榜五十。宁可这一小会儿不播。
+let worldSnap = null;
+function refreshWorldSnap(why) {
+  if (!hydrated) return null;                    // 账本还没读回来 → 不建（宁可不播也别播错档）
+  const m = new Map();
+  ranked('total').forEach((u) => m.set(u.openId, u.rank));
+  worldSnap = m;
+  log(`入场名次榜已刷新 ${m.size} 人（${why}）`);
+  return m;
+}
+
 function log(...a) { console.log('[ledger]', ...a); }
 const weekKey = (d) => { d = d || new Date(); const t = new Date(d); t.setDate(t.getDate() - ((t.getDay() + 6) % 7)); return t.getFullYear() + '-' + (t.getMonth() + 1) + '-' + t.getDate(); };
 const monthKey = (d) => { d = d || new Date(); return d.getFullYear() + '-' + (d.getMonth() + 1); };
@@ -86,7 +111,9 @@ async function flush() {
 }
 
 async function hydrate() {
-  if (!kv.enabled) { hydrated = true; return; }
+  // ⚠ 没有 Redis（纯本地/离线）也要走一次建榜：否则启动那次 freeze 被这个提前 return 跳过，
+  //   只能等 rankOfTotal 懒建。行为差别不大，但「启动就有榜」这条要在两条路上都成立。
+  if (!kv.enabled) { hydrated = true; refreshWorldSnap('启动·无Redis'); return; }
   const h = await kv.hgetall(ACCT_KEY);
   // 读不到就别置 hydrated —— 报 ready:false 让客户端退回本地，绝不能拿空表覆盖主播的账
   if (!h) { log('账本读取失败（Redis 未就绪？）→ 保持 ready:false'); return; }
@@ -117,6 +144,7 @@ async function hydrate() {
   //   而且再没有任何机会补救。先落盘再打标记：flush 失败就不打标记，下次启动重试。
   if (wReset || mReset || migrated) { accounts.forEach((_, id) => _dirty.add(id)); await flush(); await stampMeta(); }
   else await stampMeta();
+  refreshWorldSnap('启动');   // ★服务端一起来就有榜 —— 这条专治「第一局不播」
 }
 // ★存量单位迁移：票 → 分（2026-08-03 一次性）★
 //   2026-08-03 之前账本按"票"记账（仙女棒=1、药丸=10…），展示层再 ×1000 变成分；
@@ -258,12 +286,9 @@ function settle(room, winnerSide) {
     markDirty(u.openid);
   });
   flush().catch(() => {});
-  // ★入场视频名次【按局冻结】：本局结算完(奖励已入 total)后把世界榜定格一份，供【下一局】进场查档。
-  //   放在这里 = 每局结算刷新一次；本局进行中送礼不改这份榜，到下一局进场才生效（见 rankOfTotal）。
-  room.rankSnap = freezeRankSnap();
-  // ⚠ 冻结必须在 savePool【之前】：savePool 会把 room.rankSnap 一起写进存档。
-  //   顺序反了存的就是上一局那份旧榜，跨重启恢复出来永远慢一局。
-  //   2026-08-06 加持久化时就是先写后冻的，本地测出「已落盘 got=false」才抓到。
+  // ★结算完（奖励已入 total）刷新【全平台那一份】榜 —— 不再各房各存一份。
+  //   多主播并发时谁结算都只是往同一本账里加自己那局的结果，不存在互相覆盖。
+  refreshWorldSnap('结算 ' + String(room.anchor).slice(0, 10) + '…');
   savePool(room);
   return {
     winnerSide, pool: poolVal, streakPool, perShare: Math.round(perShare),
@@ -300,7 +325,8 @@ function nextRound(room) {
 //   ⚠ 跳过时必须打日志，别静默 —— 静默丢盘比写错更难查。
 function savePool(room) {
   if (!room.poolLoaded) { log('⚠️ 底池尚未成功读回，跳过落盘（防止把存档覆盖成 0）· anchor=' + String(room.anchor).slice(0, 10) + '…'); return; }
-  pool.set(room.anchor, room.pool, room.poolOpen, room.local, room.rankSnap).catch(() => {});
+  // 不再传 rankSnap：入场名次榜已改成全平台一份，不按主播落盘（见 refreshWorldSnap）
+  pool.set(room.anchor, room.pool, room.poolOpen, room.local).catch(() => {});
 }
 async function loadPool(room, anchorOpenId) {
   // ⚠ 绝不就地改写 room.anchor：房间的身份是 rooms 的【Map 键】，改这里键不会跟着变，
@@ -314,15 +340,11 @@ async function loadPool(room, anchorOpenId) {
   const p = pool.get(room.anchor);
   if (!p.ready) return room.pool;      // 读不到就别动 room.pool，也别让 savePool 拿它去覆盖存档
   room.poolLoaded = true;              // 只有真读回来过，之后才允许落盘（见 savePool）
-  // ★入场名次冻结榜跨重启恢复（2026-08-06）★
-  //   它只在 settle() 时刷新，而服务端每次部署都会重启 —— 不恢复的话，
-  //   每次部署后每个主播都要重新打完整整一局，百强入场特效才活过来。
-  //   ⚠ 只在内存里还没有时才灌：本进程已经 settle 过的那份更新，别被旧存档盖回去。
-  if (!(room.rankSnap instanceof Map) && p.rankSnap) {
-    const m = new Map();
-    for (const id in p.rankSnap) { const rk = +p.rankSnap[id] || 0; if (rk >= 1) m.set(id, rk); }
-    if (m.size) { room.rankSnap = m; log(`入场名次冻结榜已恢复 ${m.size} 人（${String(room.anchor).slice(0, 10)}…）`); }
-  }
+  // ★入场名次榜不再按主播落盘（2026-08-05 改成全平台一份）★
+  //   原来这里会从【这个主播的】存档里恢复 room.rankSnap —— 那是为了治「重启后特效哑掉」。
+  //   现在 hydrate 成功就立刻建一份全局榜（见 refreshWorldSnap），根因没了，这套也就不需要了。
+  //   存量记录里残留的 rs 字段无人读取，下次 set 时自然被覆盖掉。
+
   room.pool = p.pool;
   // 每人的本局分也跟着主播恢复（跨重启/换机都在）
   if (p.rounds) for (const id in p.rounds) R.local(room, id).round = +p.rounds[id] || 0;
@@ -399,19 +421,15 @@ function worldList() { return ranked('month'); }
 // 入场视频的名次【按局冻结】—— 每局结算(settle)时把当时的世界榜定格一份，本局进行中送礼【不即时改档】。
 // 口径同结算面板世界榜 ranked('total')：① 只收 total>0 的人（没积分不上榜）；② 按排序序位给名次，
 // 同分也落不同档（不再像旧的严格 `>` 计数那样把同分全并成「榜一」→ 一堆人共用同一条入场视频）。
-function freezeRankSnap() {
-  const snap = new Map();
-  ranked('total').forEach((u) => snap.set(u.openId, u.rank));   // openId -> 名次(1-based·含 RANK_CAP 封顶)
-  return snap;
-}
-// 查某人的【入场视频名次】(1-based)：只读上一局结算时冻结的那份榜(room.rankSnap)，不再实时查 accounts。
-// · 首局 / 服务端重启后的第一局还没有冻结榜 → 一律 0(不播) → 天然实现「第二局进场才有入场特效」。
-// · 不在冻结榜里(上一局结算时没积分/没上榜) → 0(没积分不上榜)。
-// ★2026-08-05 用户定：排行榜每局结算一次，本局刷的礼物到【下一局】进场才生效，不再实时结算。
-function rankOfTotal(openId, room) {
+
+// 查某人的【入场视频名次】(1-based)，不在榜返回 0（没积分不上榜 —— 用户确认这条是对的）。
+// ⚠ 第二个参数 room 已废弃：名次是全平台共享的，跟哪个直播间无关。
+//   形参留着只为不打断现有调用点（ranking.worldRankOf 两处、userTeam 两处），别再传新东西进来。
+function rankOfTotal(openId, _roomDeprecated) {
   if (!openId) return 0;
-  const snap = room && room.rankSnap instanceof Map ? room.rankSnap : null;
-  if (!snap) return 0;
+  // 还没建过榜（hydrate 刚好慢一步）→ 补建一次，别让开播头几秒白白不播
+  const snap = worldSnap || refreshWorldSnap('懒建');
+  if (!snap) return 0;                            // 账本没就绪 → 不播（不是"没积分"，是"还不知道"）
   return snap.get(openId) || 0;
 }
 function peek(limit) {
@@ -419,7 +437,7 @@ function peek(limit) {
     .map((u) => ({ open_id: u.openId, rank: u.rank, score: u.score }));
 }
 
-function diag() { return { accounts: accounts.size, hydrated, rooms: R.diag() }; }
+function diag() { return { accounts: accounts.size, hydrated, worldSnap: worldSnap ? worldSnap.size : 0, rooms: R.diag() }; }
 async function reset(prefix) {
   const hit = [...accounts.keys()].filter((id) => !prefix || id.startsWith(prefix));
   hit.forEach((id) => accounts.delete(id));
