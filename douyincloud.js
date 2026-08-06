@@ -138,7 +138,18 @@ async function startGame(headers, body) {
   log('开局', ctx.roomId, ctx.nickName);
   // ★清落座只清【这个主播自己房间】的：原来 clearSides() 清的是全局表，
   //   于是 A 主播开新局会把正在播的 B 主播房里所有观众的阵营一起清掉。
-  if (ctx.anchorOpenId) dy.clearSides(rooms.get(ctx.anchorOpenId).side); else dy.clearSides();
+  // ★2026-08-07 加 active 守卫：局中重开 exe 绝不清座位。
+  //   原来是无条件清。主播中途重开 exe（卡了/崩了/误关）时 room.active 仍是 true，
+  //   于是从 /start_game 到他点「开始对决」这段空窗期里，全场落座锁被清空而互动照常计分：
+  //   送礼的人被 hashSide 重新随机落座、ledger.record 把 l.side 改成新边
+  //   —— 主播看到的就是「观众莫名换队、小火箭换边」。
+  //   ⚠ 守卫不会让「关 exe 重开」出问题（已实测）：重开后主播必然要点「开始对决」，
+  //     那一下 /round/start 因 needReload=true 走 fresh 分支，index.js 里会把表清干净。
+  //     所以这里这次清本来就是冗余的，留着只制造空窗期。
+  const _rm = ctx.anchorOpenId ? rooms.get(ctx.anchorOpenId) : null;
+  if (!_rm) dy.clearSides();                       // 拿不到主播身份 → 清模块级兜底表（老调用/自查工具）
+  else if (!_rm.active) dy.clearSides(_rm.side);   // 不在局中 → 正常清
+  else log('局中重开 exe（room.active=true）→ 跳过清落座表，保住全场观众的队和锁');
   if (ctx.anchorOpenId) lastAnchorOpenId = ctx.anchorOpenId;     // 供下行 pushToClient / 战绩用（单主播遗产，多房已改走 rooms 索引）
   if (ctx.roomId) await startTasks(ctx.roomId);
   if (ctx.roomId) rank.startRound(ctx.roomId, ctx.anchorOpenId);   // 传该场主播 openid(动态·非固定 env)          // 本局榜：开局

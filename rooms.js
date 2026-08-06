@@ -19,6 +19,10 @@
 // ============================================================
 'use strict';
 
+const kv = require('./kv');            // 只用来落 roomId→anchor 索引，见 bindRoomId 的注释
+const RID_KEY = 'qd:rid';              // Redis hash：field=roomId, value={a:anchor, t:写入时间}
+const RID_TTL_MS = 7 * 24 * 3600 * 1000;   // 索引保留 7 天：一场直播的 roomId 活不了这么久，过期即清
+
 const GC_MS = 5 * 60 * 60 * 1000;      // 空房回收：5 小时无活动（用户 2026-08-05 定）。底池已落盘，回收不丢钱。
 const REPLAY_MAX = 256;                // 每房各自的断点续传环形缓冲（原来是全局一份，多房会互相挤掉）
 
@@ -102,10 +106,48 @@ function get(anchor) {
 }
 
 // ── 索引：把回调/连接认领到某个房 ──
+// ★2026-08-07：roomId→anchor 这张索引【必须落盘】★
+//   它是全服唯一一条「丢了就无法自愈」的状态：
+//     · 抖音回调只带 roomId，认不出 anchor 就落兜底房（index.js 的 roomOfCb 没有第三级）；
+//     · 而主播端只在 exe 启动那一刻发一次 /start_game（electron-main.js:150），
+//       WS 重连、SSE 重连都【不会】重发 —— 服务端重启后没有任何路径会重建它。
+//   抖音云 prod 实例会频繁回收，于是回收之后所有还在播的主播【全部塌进同一个兜底房】：
+//   甲直播间观众刷的钱进共用底池、结算时分给乙直播间的观众，savePool 也只往兜底那格写。
+//   本地实测（索引缺失态）：两个 roomId 的观众落进同一个 __default__，players=2、共用一个 pool。
+//   ⚠ 只落这一张【小索引】，不要落落座表本身：
+//     落座表高频写、量大，且丢了观众重喊一次 1/2 就补回来了；
+//     这张索引每场直播只写一次，零高频开销，却挡住唯一一条会「钱串场」的路。
 function bindRoomId(roomId, anchor) {
   if (!roomId) return;
-  byRoomId.set(String(roomId), String(anchor || '').trim() || DEFAULT_ANCHOR);
+  const a = String(anchor || '').trim() || DEFAULT_ANCHOR;
+  byRoomId.set(String(roomId), a);
+  // 兜底房不落盘：它本来就是「认不出主播」的收容所，存了反而会把错误固化下来
+  if (a !== DEFAULT_ANCHOR) {
+    kv.hset(RID_KEY, [String(roomId), JSON.stringify({ a, t: Date.now() })]).catch(() => {});
+  }
 }
+// 启动时把索引读回来。与 pool.js 同节奏（延迟 800ms 等 kv 连上）。
+// ⚠ 只补【内存里还没有的】：正在跑的绑定优先，绝不用旧存档覆盖当前这一场。
+async function hydrateRid() {
+  if (!kv.enabled) return;
+  const h = await kv.hgetall(RID_KEY);
+  if (!h) { console.log('[rooms] roomId 索引读取失败（Redis 未就绪？）→ 本次不恢复，回调会先落兜底房'); return; }
+  const now = Date.now();
+  const stale = [];
+  let n = 0;
+  for (const rid in h) {
+    try {
+      const v = JSON.parse(h[rid]);
+      if (!v || !v.a) { stale.push(rid); continue; }
+      if (now - (v.t || 0) > RID_TTL_MS) { stale.push(rid); continue; }   // 过期：一场直播的 roomId 活不了这么久
+      if (!byRoomId.has(rid)) { byRoomId.set(rid, v.a); n++; }
+    } catch (_) { stale.push(rid); }
+  }
+  if (stale.length) kv.hdel(RID_KEY, stale).catch(() => {});
+  console.log(`[rooms] roomId→主播 索引已恢复 ${n} 条` + (stale.length ? `（顺带清理过期/损坏 ${stale.length} 条）` : ''));
+}
+const _ridBoot = setTimeout(() => { hydrateRid().catch(() => {}); }, 800);
+if (_ridBoot.unref) _ridBoot.unref();
 function bindToken(token, anchor) {
   if (!token) return;
   byToken.set(String(token), String(anchor || '').trim() || DEFAULT_ANCHOR);
