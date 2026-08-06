@@ -258,10 +258,13 @@ function settle(room, winnerSide) {
     markDirty(u.openid);
   });
   flush().catch(() => {});
-  savePool(room);
   // ★入场视频名次【按局冻结】：本局结算完(奖励已入 total)后把世界榜定格一份，供【下一局】进场查档。
   //   放在这里 = 每局结算刷新一次；本局进行中送礼不改这份榜，到下一局进场才生效（见 rankOfTotal）。
   room.rankSnap = freezeRankSnap();
+  // ⚠ 冻结必须在 savePool【之前】：savePool 会把 room.rankSnap 一起写进存档。
+  //   顺序反了存的就是上一局那份旧榜，跨重启恢复出来永远慢一局。
+  //   2026-08-06 加持久化时就是先写后冻的，本地测出「已落盘 got=false」才抓到。
+  savePool(room);
   return {
     winnerSide, pool: poolVal, streakPool, perShare: Math.round(perShare),
     rows: byRound.map((u) => ({
@@ -297,7 +300,7 @@ function nextRound(room) {
 //   ⚠ 跳过时必须打日志，别静默 —— 静默丢盘比写错更难查。
 function savePool(room) {
   if (!room.poolLoaded) { log('⚠️ 底池尚未成功读回，跳过落盘（防止把存档覆盖成 0）· anchor=' + String(room.anchor).slice(0, 10) + '…'); return; }
-  pool.set(room.anchor, room.pool, room.poolOpen, room.local).catch(() => {});
+  pool.set(room.anchor, room.pool, room.poolOpen, room.local, room.rankSnap).catch(() => {});
 }
 async function loadPool(room, anchorOpenId) {
   // ⚠ 绝不就地改写 room.anchor：房间的身份是 rooms 的【Map 键】，改这里键不会跟着变，
@@ -311,6 +314,15 @@ async function loadPool(room, anchorOpenId) {
   const p = pool.get(room.anchor);
   if (!p.ready) return room.pool;      // 读不到就别动 room.pool，也别让 savePool 拿它去覆盖存档
   room.poolLoaded = true;              // 只有真读回来过，之后才允许落盘（见 savePool）
+  // ★入场名次冻结榜跨重启恢复（2026-08-06）★
+  //   它只在 settle() 时刷新，而服务端每次部署都会重启 —— 不恢复的话，
+  //   每次部署后每个主播都要重新打完整整一局，百强入场特效才活过来。
+  //   ⚠ 只在内存里还没有时才灌：本进程已经 settle 过的那份更新，别被旧存档盖回去。
+  if (!(room.rankSnap instanceof Map) && p.rankSnap) {
+    const m = new Map();
+    for (const id in p.rankSnap) { const rk = +p.rankSnap[id] || 0; if (rk >= 1) m.set(id, rk); }
+    if (m.size) { room.rankSnap = m; log(`入场名次冻结榜已恢复 ${m.size} 人（${String(room.anchor).slice(0, 10)}…）`); }
+  }
   room.pool = p.pool;
   // 每人的本局分也跟着主播恢复（跨重启/换机都在）
   if (p.rounds) for (const id in p.rounds) R.local(room, id).round = +p.rounds[id] || 0;

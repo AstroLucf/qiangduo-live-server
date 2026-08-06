@@ -183,6 +183,8 @@ function diag() {
       anchor: r.anchor === DEFAULT_ANCHOR ? r.anchor : r.anchor.slice(0, 12) + '…',
       roomId: r.roomId, clients: r.clients.size, active: r.active,
       pool: r.pool, players: r.local.size, seq: r.eventSeq,
+      rankSnap: r.rankSnap instanceof Map ? r.rankSnap.size : 0,   // 0 = 这房还没冻结过名次 → 入场特效必然不播
+      poolLoaded: !!r.poolLoaded,
       idleMin: Math.round((Date.now() - r.lastSeen) / 60000),
     })),
   };

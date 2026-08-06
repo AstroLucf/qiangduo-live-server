@@ -57,7 +57,8 @@ async function hydrate() {
       //   底池每重启一次 ×1000。这条是 2026-08-03 实测抓到的，别再改回只取 p/o/t。
       // ⚠ r（每人本局分）同理必须带进来 —— 漏掉它，落盘了也白落，重启后 round 全归零。
       //   2026-08-05 加这个字段时就差点漏掉，和 u 是同一类错：解析处少写一个键，持久化就等于没做。
-      const rec = normUnit({ p: +v.p || 0, o: !!v.o, t: v.t || 0, u: v.u, r: v.r });
+      // ⚠ rs（入场名次冻结榜）与 r 同理：解析处少写一个键，落盘就等于没做。
+      const rec = normUnit({ p: +v.p || 0, o: !!v.o, t: v.t || 0, u: v.u, r: v.r, rs: v.rs });
       mem.set(a, rec); n++;
       if (rec.u !== v.u) migrated.push(a);            // 本次刚换算的，要写回 Redis
     } catch (_) {}
@@ -105,7 +106,8 @@ function get(anchor) {
     log(`底池单位迁移 票→分 ×${LEGACY_VOTE_TO_SCORE}：${a.slice(0, 8)}… → ${v.p}`);
   }
   return { anchor: a, pool: Math.max(0, Math.round(v.p || 0)), open: !!v.o, at: v.t || 0, ready: hydrated,
-           rounds: v.r || null };   // r = {openId: 本局分}，跟着主播跨重启恢复
+           rounds: v.r || null,     // r = {openId: 本局分}，跟着主播跨重启恢复
+           rankSnap: v.rs || null };   // rs = {openId: 入场名次}，见 set() 的 RANK_KEEP 注释
 }
 
 // 每局结转后（以及局中低频心跳）落盘。写内存 + 落 Redis，失败不抛。
@@ -114,7 +116,14 @@ function get(anchor) {
 //     被截掉的人下次开局 round 从 0 起（他们本来分就低），这是明确的取舍、不是 bug —— 
 //     所以下面会把截掉的人数打进日志，不静默丢。
 const ROUND_CAP = 200;
-async function set(anchor, pool, open, local) {
+// ★入场名次冻结榜也跟着主播落盘（2026-08-06）★
+//   原来 room.rankSnap 只活在进程内存里，服务端每次部署/重启就归零 ——
+//   而它只在 settle() 时刷新，于是「重启后每个主播都要先打完整整一局，百强入场特效才恢复」。
+//   实测那天部署了好几次，这个特效基本一整天是哑的。
+//   ⚠ 只存前 RANK_KEEP 名：入场视频本来就只认前 100（userTeam 的 RANK_ENTER_MAX），
+//     101 名之后存了也没人查，白撑大记录。
+const RANK_KEEP = 100;
+async function set(anchor, pool, open, local, rankSnap) {
   const a = norm(anchor);
   let r;
   if (local instanceof Map) {
@@ -122,8 +131,14 @@ async function set(anchor, pool, open, local) {
     if (arr.length > ROUND_CAP) log(`本局分落盘截断：${arr.length} 人 → 只存前 ${ROUND_CAP} 名（${a.slice(0, 8)}…）`);
     r = {}; for (const [id, l] of arr.slice(0, ROUND_CAP)) r[id] = l.round;
   }
+  let rs;
+  if (rankSnap instanceof Map && rankSnap.size) {
+    rs = {};
+    for (const [id, rk] of rankSnap) if (rk >= 1 && rk <= RANK_KEEP) rs[id] = rk;
+  }
   const v = { p: Math.max(0, Math.round(+pool || 0)), o: !!open, t: Date.now(), u: UNIT_TAG };
   if (r) v.r = r;
+  if (rs) v.rs = rs;
   mem.set(a, v);
   if (kv.enabled) await kv.hset(KEY, [a, JSON.stringify(v)]);
   return get(a);
