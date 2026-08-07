@@ -31,6 +31,13 @@ const DEFEAT_BONUS_RATE = 0.2;
 const INHERIT_RATE = 0.4;
 const STREAK_LOSE = 0.5;
 const STREAK_SPLIT = { 1: [1], 2: [0.6, 0.4], 3: [0.5, 0.3, 0.2] };
+// ⚠️ 【连胜分 streak 这套池子机制目前是空转的，这是有意的】
+//   streak 只有三种写法：初始化 0、从败方扣、给胜方前三分 —— 全是【转移】，
+//   没有任何一处能凭空产生。所以「人人初始 0 → 败方扣 0 → 池子 0 → 胜方分 0 → 永远 0」。
+//   线上实证（2026-08-07）：prod 125 个账户 streak 全为 0，其中最高 total 有 2175 万分。
+//   用户 2026-08-07 定：**暂时不加任何积分，连胜榜只按【连胜次数】排名**。
+//   → 榜单展示改用 winStreak（见 snapshot），下面这套 streak 池子逻辑【保留但不展示】，
+//     以后要恢复"连胜分"玩法时，只需在结算里补一条产生入口即可，别删。
 
 const ACCT_KEY = 'qd:acct';       // Redis hash：field = openId，value = JSON（只存跨局字段）
 const META_KEY = '__meta__';      // 同一张 hash 里借一格存周/月戳，省一个 key
@@ -466,7 +473,14 @@ function snapshot(room) {
     if (seen.has(id)) return; seen.add(id);
     const a = acct(id);
     list.push({ openid: id, name: a.name, avatar: a.avatar,
-                total: a.total, week: a.week, month: a.month, streak: a.streak,
+                // ★★ streak 这一格下发的是【连胜次数 winStreak】，不是连胜池分 a.streak ★★
+                //   用户 2026-08-07 定：「暂时不加任何积分，只显示谁连胜多谁排前面」。
+                //   客户端 src/score.js:480 的连胜榜 tab 读的就是 u.streak、label 写的是「连胜」，
+                //   所以在服务端换掉这一格的内容 = 榜单立刻按连胜次数排，【客户端零改动、不用出包】。
+                //   ⚠ 语义上字段名和内容对不上，是 D-1 的权宜之计。下个包给客户端加 winStreak 字段后，
+                //     这里改回 a.streak、客户端 tab 指向 winStreak，才是干净的做法。
+                //   ⚠ a.streak（连胜池分）仍在正常持久化，只是不再展示 —— 别顺手删。
+                total: a.total, week: a.week, month: a.month, streak: a.winStreak,
                 round: l ? l.round : 0, fresh: l ? l.fresh : 0,
                 likes: l ? l.likes : 0, gifts: l ? l.gifts : 0, side: l ? l.side : null });
   };
@@ -483,7 +497,10 @@ function snapshot(room) {
   //     直接 put 会让 acct() 凭空建一条空账户回来。
   const fill = (metric) => topIds(metric, SNAP_TOP)
     .forEach((id) => { if (accounts.has(id)) put(id, room.local.get(id)); });
-  ['total', 'week', 'month', 'streak'].forEach(fill);
+  //   ⚠ 第四个用 'winStreak' 不是 'streak'：榜单展示的是连胜次数（见上面 put 里的说明），
+  //     这里若还按 a.streak 取前 N，取到的是【全 0 的连胜池分榜】（topIds 会 filter 掉 =0 的人，
+  //     结果是空集）→ 榜上只剩本房参战者，纯观战的连胜王一行都不出现。
+  ['total', 'week', 'month', 'winStreak'].forEach(fill);
   if (list.length > UNION_CAP) {
     log(`⚠️ 快照名单 ${list.length} 人（>${UNION_CAP}）—— 四榜并集偏大，SSE 体积需要关注`);
   }
