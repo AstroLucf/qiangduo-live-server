@@ -74,7 +74,7 @@ let hydrated = false;
 //       总分榜2 周榜月榜都3   → 播 2（总分榜）
 //   即：名次 = min(周榜名次, 月榜名次, 总分榜名次)，数值越小越靠前。
 //   ⚠ 某个榜【没上榜】的人不参与那个榜的比较 —— ranked(metric) 已经把该指标 =0 的人过滤掉了，
-//     所以周榜清零后（每周一）大家只靠月榜/总分榜争档位，不会被"周榜第 0 名"这种鬼值拉下去。
+//     所以周榜清零后（每周五 20:00）大家只靠月榜/总分榜争档位，不会被"周榜第 0 名"这种鬼值拉下去。
 //   ⚠ 三个榜都没有（total=0，纯新观众）→ 查不到 → 名次 0 → 不播。这条是设计如此，
 //     和「首局不播」不是一回事，别一起改掉。
 const ENTRY_METRICS = ['total', 'week', 'month'];   // 参与"取最靠前"的三个榜
@@ -96,13 +96,24 @@ function refreshWorldSnap(why) {
 function log(...a) { console.log('[ledger]', ...a); }
 // ── 周/月边界：一律按【北京时间】算（2026-08-07 用户定）──
 // ⚠ 绝不能用本地时区：抖音云容器是 UTC（Dockerfile 没设 TZ，node:16-alpine 默认 UTC），
-//   于是换周点落在北京时间【周一早 8 点】，而规则要的是「周日 23:59:59 重置」—— 晚了 8 小时，
-//   周日深夜到周一早上刷的分会记到上一周。
+//   于是换周点会落在北京时间的错误钟点上 —— 那一段时间刷的分会记到上一周期。
 //   做法：把时间戳整体 +8h 再用 UTC 方法读，这样无论容器时区是什么，结果都是北京时间的年月日。
 const BJ_OFFSET_MS = 8 * 3600 * 1000;
 const bjTime = (d) => new Date((d ? d.getTime() : Date.now()) + BJ_OFFSET_MS);
-// 周键 = 本周【周一】的北京日期（周日 23:59:59 仍属上周，周一 00:00 换新周 —— 与规则一致）
-const weekKey = (d) => { const t = bjTime(d); t.setUTCDate(t.getUTCDate() - ((t.getUTCDay() + 6) % 7)); return t.getUTCFullYear() + '-' + (t.getUTCMonth() + 1) + '-' + t.getUTCDate(); };
+// 周键 = 本周期起点【周五 20:00】的北京日期（2026-08-08 用户改，原为周一 00:00）
+// ⚠ 边界不在午夜 → 不能只按日期回退，必须【先减 20 小时、再对齐到周五】：
+//     周五 20:00:00 → 减 20h = 周五 00:00 → 对齐后仍是本周五 → 换新周期 ✓
+//     周五 19:59:59 → 减 20h = 周四 23:59 → 对齐后回到上周五 → 仍属上周期 ✓
+//   (getUTCDay()+2)%7 = 「回退到最近的周五」要减的天数（周五=5 → 0、周六=6 → 1、周日=0 → 2）。
+//   ⚠ 减小时用 setUTCHours(getUTCHours()-20)：它会自动借位到前一天，别改成手动拆日期。
+const WEEK_ANCHOR_HOUR = 20;                 // 周五 20:00（北京时间）
+const weekKey = (d) => {
+  const t = bjTime(d);
+  t.setUTCHours(t.getUTCHours() - WEEK_ANCHOR_HOUR);
+  t.setUTCDate(t.getUTCDate() - ((t.getUTCDay() + 2) % 7));
+  return t.getUTCFullYear() + '-' + (t.getUTCMonth() + 1) + '-' + t.getUTCDate();
+};
+// 月键 = 北京时间的「年-月」→ 每月 1 号 00:00 自然换月，与规则一致，不需要偏移。
 const monthKey = (d) => { const t = bjTime(d); return t.getUTCFullYear() + '-' + (t.getUTCMonth() + 1); };
 
 // ⚠ streak 和 winStreak 是两个东西，别合并：
@@ -152,7 +163,7 @@ async function hydrate() {
   let meta = {};
   try { meta = JSON.parse(h[META_KEY] || '{}'); } catch (_) {}
   const wk = weekKey(), mk = monthKey();
-  const wReset = meta.wk && meta.wk !== wk;      // 周榜每周一切
+  const wReset = meta.wk && meta.wk !== wk;      // 周榜每周五 20:00 切
   const mReset = meta.mk && meta.mk !== mk;      // 月榜 + 连胜榜每月 1 号切
   let n = 0;
   for (const id in h) {
@@ -186,7 +197,7 @@ async function hydrate() {
 //     ② 等实例被回收、新实例 hydrate，才发现 meta.wk 过期 → 把整个 week 清零
 //        —— 连同跨周之后新赚的那部分一起抹掉。
 //   已实测：Redis 里 w=250000（上周 5 万 + 跨周后新赚 20 万）→ 新实例 hydrate 后写回 w=0。
-//   抖音云 prod 实例几分钟回收一次，所以「周一早上赚的分下一次回收就没了」是常态。
+//   抖音云 prod 实例几分钟回收一次，所以「换周点之后赚的分下一次回收就没了」是常态。
 //   现在改成到点就清：跨界那一刻清零，之后赚的分属于新周期，不会再被误清。
 let _curWk = null, _curMk = null;
 function rollCheck() {
